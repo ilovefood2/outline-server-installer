@@ -25,6 +25,7 @@ cd "${SCRIPT_DIR}"
 IMAGE_TAG="${SB_IMAGE:-localhost/outline/shadowbox:stable}"
 SKIP_BUILD=0
 SKIP_DEPS=0
+FORCE_BUILD=0
 LAN_ACCESS=1
 LAN_SUBNET=""
 HOSTNAME_FLAG=()
@@ -53,6 +54,7 @@ Options:
   --lan-subnet <CIDR> Specify LAN subnet for --lan-access (auto-detected if omitted)
   --image <tag>       Docker image to run (default: ${IMAGE_TAG})
   --skip-build        Do not build; require --image or an existing local image
+  --rebuild           Build a fresh local image even if the image already exists
   --skip-deps         Do not install Node/Go (build must already be possible)
   -h, --help          Show help
 
@@ -75,6 +77,7 @@ while (( $# > 0 )); do
     --lan-subnet) LAN_SUBNET="$2"; shift 2 ;;
     --image) IMAGE_TAG="$2"; shift 2 ;;
     --skip-build) SKIP_BUILD=1; shift ;;
+    --rebuild) FORCE_BUILD=1; shift ;;
     --skip-deps) SKIP_DEPS=1; shift ;;
     -h|--help) usage; exit 0 ;;
     *)
@@ -137,7 +140,11 @@ have_image() {
   docker image inspect "${IMAGE_TAG}" >/dev/null 2>&1
 }
 
-if have_image; then
+if (( SKIP_BUILD && FORCE_BUILD )); then
+  die "--skip-build and --rebuild cannot be used together."
+fi
+
+if have_image && (( FORCE_BUILD == 0 )); then
   log "Using existing image ${IMAGE_TAG}"
 elif (( SKIP_BUILD )); then
   log "Pulling ${IMAGE_TAG}..."
@@ -163,7 +170,11 @@ else
     fi
   fi
 
-  log "Building Outline Server image (first run can take several minutes)..."
+  if (( FORCE_BUILD )); then
+    log "Rebuilding Outline Server image..."
+  else
+    log "Building Outline Server image (first run can take several minutes)..."
+  fi
   # Run build as the real user when possible so files aren't all root-owned,
   # but docker needs group access — use root if user not in docker group yet.
   export PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"

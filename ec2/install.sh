@@ -35,7 +35,7 @@ Options are forwarded to the shared installer:
   --lan-access | --no-lan-access
   --lan-subnet <CIDR>
   --image <tag>
-  --skip-build | --skip-deps
+  --skip-build | --rebuild | --skip-deps
   -h, --help
 
 Before installation, configure your EC2 security group:
@@ -87,7 +87,7 @@ while (( $# > 0 )); do
       ARGS+=("$1" "$2")
       shift 2
       ;;
-    --lan-access|--no-lan-access|--skip-build|--skip-deps)
+    --lan-access|--no-lan-access|--skip-build|--rebuild|--skip-deps)
       ARGS+=("$1")
       shift
       ;;
@@ -108,6 +108,6 @@ echo "    VPC access   : enabled"
 
 echo
 echo "Security-group reminder: allow TCP/UDP 80 for clients and TCP 443 for trusted managers."
-echo "Use an Elastic IP or stable DNS name with --hostname."
+echo "Use an Elastic IP or stable DNS name; pass --hostname only to override public-IP auto-detection."
 
 exec bash "${ROOT_DIR}/install.sh" "${ARGS[@]}"

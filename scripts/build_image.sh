@@ -53,6 +53,14 @@ while (( $# > 0 )); do
   esac
 done
 
+# Outline source tags use the server-v prefix, but the Manager API exposes this
+# value to the desktop Manager, which requires a semantic version such as 1.12.3.
+SERVER_VERSION="${OUTLINE_VERSION#server-v}"
+SERVER_VERSION="${SERVER_VERSION#v}"
+if [[ ! "${SERVER_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.+][0-9A-Za-z.-]+)?$ ]]; then
+  SERVER_VERSION="0.0.0-dev"
+fi
+
 command -v docker >/dev/null || die "Docker is required. Install it first (./scripts/setup_docker.sh)."
 command -v git >/dev/null || die "git is required."
 command -v node >/dev/null || die "Node.js 18+ is required to build. See README."
@@ -133,16 +141,18 @@ fi
 
 log "Building shadowbox for ${ARCH} as ${TASK_ARCH} (${DOCKER_PLATFORM})..."
 log "Image will be tagged: ${IMAGE_TAG}"
+log "Manager runtime version: ${SERVER_VERSION}"
 
 # Disable BuildKit if docker buildx is not available (e.g. Docker Desktop not configured)
 if ! docker buildx version >/dev/null 2>&1; then
   export DOCKER_BUILDKIT=0
 fi
 
-# Taskfile uses TARGET_ARCH to derive Go's GOARCH, so it must receive arm64.
+# Taskfile uses TARGET_ARCH to derive Go's GOARCH, so it must receive the
+# normalized architecture name (arm64 or x86_64).
 "${TASK_BIN}" shadowbox:docker:build \
   IMAGE_NAME="${IMAGE_TAG}" \
-  IMAGE_VERSION="${OUTLINE_VERSION}" \
+  IMAGE_VERSION="${SERVER_VERSION}" \
   TARGET_ARCH="${TASK_ARCH}"
 
 log "Verifying image..."
@@ -156,8 +166,9 @@ Build complete.
 
   Image:    ${IMAGE_TAG}
   Arch:     ${ARCH} → ${TASK_ARCH} (${DOCKER_PLATFORM})
-  Source:   ${SOURCE_DIR}
-  Version:  ${OUTLINE_VERSION}
+  Checkout: ${SOURCE_DIR}
+  Source:   ${OUTLINE_VERSION}
+  Runtime:  ${SERVER_VERSION}
 
 Next step — install/run the server:
 
