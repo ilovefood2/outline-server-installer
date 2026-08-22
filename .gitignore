@@ -1,0 +1,8 @@
+.build/
+node_modules/
+*.tar
+*.tar.gz
+*.sha256
+config/outline.env
+.DS_Store
+outline-shadowbox-*.tar.gz

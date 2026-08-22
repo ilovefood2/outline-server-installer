@@ -1,0 +1,231 @@
+diff --git a/src/shadowbox/server/main.ts b/src/shadowbox/server/main.ts
+index 8f52c18..8a36be5 100644
+--- a/src/shadowbox/server/main.ts
++++ b/src/shadowbox/server/main.ts
+@@ -227,7 +227,8 @@ async function main() {
+     accessKeyRepository,
+     shadowsocksServer,
+     managerMetrics,
+-    metricsPublisher
++    metricsPublisher,
++    process.env.SB_ACCESS_KEY_PREFIX || ''
+   );
+ 
+   const certificateFilename = process.env.SB_CERTIFICATE_FILE;
+diff --git a/src/shadowbox/server/manager_service.spec.ts b/src/shadowbox/server/manager_service.spec.ts
+index 22e04c8..b57f7bf 100644
+--- a/src/shadowbox/server/manager_service.spec.ts
++++ b/src/shadowbox/server/manager_service.spec.ts
+@@ -237,14 +237,18 @@ describe('ShadowsocksManagerService', () => {
+   describe('getAccessKey', () => {
+     it('Returns an access key', async (done) => {
+       const repo = getAccessKeyRepository();
+-      const service = new ShadowsocksManagerServiceBuilder().accessKeys(repo).build();
++      const service = new ShadowsocksManagerServiceBuilder()
++        .accessKeys(repo)
++        .accessKeyPrefix('POST%20')
++        .build();
+       const key1 = await createNewAccessKeyWithName(repo, 'keyName1');
+       service.getAccessKey(
+         {params: {id: key1.id}},
+         {
+-          send: (httpCode, data: AccessKey) => {
++          send: (httpCode, data: {id: string; accessUrl: string}) => {
+             expect(httpCode).toEqual(200);
+             expect(data.id).toEqual('0');
++            expect(data.accessUrl).toMatch(/&prefix=POST%20$/);
+             responseProcessed = true;
+           },
+         },
+@@ -266,7 +270,10 @@ describe('ShadowsocksManagerService', () => {
+   describe('listAccessKeys', () => {
+     it('lists access keys in order', async (done) => {
+       const repo = getAccessKeyRepository();
+-      const service = new ShadowsocksManagerServiceBuilder().accessKeys(repo).build();
++      const service = new ShadowsocksManagerServiceBuilder()
++        .accessKeys(repo)
++        .accessKeyPrefix('POST%20')
++        .build();
+       // Create 2 access keys with names.
+       const key1 = await createNewAccessKeyWithName(repo, 'keyName1');
+       const key2 = await createNewAccessKeyWithName(repo, 'keyName2');
+@@ -279,6 +286,9 @@ describe('ShadowsocksManagerService', () => {
+           expect(data.accessKeys[0].id).toEqual(key1.id);
+           expect(data.accessKeys[1].name).toEqual(key2.name);
+           expect(data.accessKeys[1].id).toEqual(key2.id);
++          expect(
++            data.accessKeys.every(({accessUrl}) => accessUrl.endsWith('&prefix=POST%20'))
++          ).toEqual(true);
+           responseProcessed = true; // required for afterEach to pass.
+         },
+       };
+@@ -313,7 +323,10 @@ describe('ShadowsocksManagerService', () => {
+ 
+     beforeEach(() => {
+       repo = getAccessKeyRepository();
+-      service = new ShadowsocksManagerServiceBuilder().accessKeys(repo).build();
++      service = new ShadowsocksManagerServiceBuilder()
++        .accessKeys(repo)
++        .accessKeyPrefix('POST%20')
++        .build();
+     });
+ 
+     describe('handling the access key identifier', () => {
+@@ -397,6 +410,7 @@ describe('ShadowsocksManagerService', () => {
+               expect(httpCode).toEqual(201);
+               expect(Object.keys(data).sort()).toEqual(EXPECTED_ACCESS_KEY_PROPERTIES);
+               expect(data.method).toEqual('chacha20-ietf-poly1305');
++              expect(data.accessUrl).toMatch(/&prefix=POST%20$/);
+               responseProcessed = true; // required for afterEach to pass.
+             },
+           };
+@@ -1221,6 +1235,7 @@ class ShadowsocksManagerServiceBuilder {
+   private shadowsocksServer_: ShadowsocksServer = null;
+   private managerMetrics_: ManagerMetrics = null;
+   private metricsPublisher_: SharedMetricsPublisher = null;
++  private accessKeyPrefix_ = '';
+ 
+   defaultServerName(name: string): ShadowsocksManagerServiceBuilder {
+     this.defaultServerName_ = name;
+@@ -1252,6 +1267,11 @@ class ShadowsocksManagerServiceBuilder {
+     return this;
+   }
+ 
++  accessKeyPrefix(prefix: string): ShadowsocksManagerServiceBuilder {
++    this.accessKeyPrefix_ = prefix;
++    return this;
++  }
++
+   build(): ShadowsocksManagerService {
+     return new ShadowsocksManagerService(
+       this.defaultServerName_,
+@@ -1259,7 +1279,8 @@ class ShadowsocksManagerServiceBuilder {
+       this.accessKeys_,
+       this.shadowsocksServer_,
+       this.managerMetrics_,
+-      this.metricsPublisher_
++      this.metricsPublisher_,
++      this.accessKeyPrefix_
+     );
+   }
+ }
+diff --git a/src/shadowbox/server/manager_service.ts b/src/shadowbox/server/manager_service.ts
+index 91bd25f..876eccd 100644
+--- a/src/shadowbox/server/manager_service.ts
++++ b/src/shadowbox/server/manager_service.ts
+@@ -42,8 +42,17 @@ interface AccessKeyJson {
+   accessUrl: string;
+ }
+ 
+-// Creates a AccessKey response.
+-function accessKeyToApiJson(accessKey: AccessKey): AccessKeyJson {
++// Creates an AccessKey response. accessKeyPrefix must already be URL-encoded.
++function accessKeyToApiJson(accessKey: AccessKey, accessKeyPrefix: string): AccessKeyJson {
++  const accessUrl = SIP002_URI.stringify(
++    makeConfig({
++      host: accessKey.proxyParams.hostname,
++      port: accessKey.proxyParams.portNumber,
++      method: accessKey.proxyParams.encryptionMethod,
++      password: accessKey.proxyParams.password,
++      outline: 1,
++    })
++  );
+   return {
+     id: accessKey.id,
+     name: accessKey.name,
+@@ -51,15 +60,7 @@ function accessKeyToApiJson(accessKey: AccessKey): AccessKeyJson {
+     port: accessKey.proxyParams.portNumber,
+     method: accessKey.proxyParams.encryptionMethod,
+     dataLimit: accessKey.dataLimit,
+-    accessUrl: SIP002_URI.stringify(
+-      makeConfig({
+-        host: accessKey.proxyParams.hostname,
+-        port: accessKey.proxyParams.portNumber,
+-        method: accessKey.proxyParams.encryptionMethod,
+-        password: accessKey.proxyParams.password,
+-        outline: 1,
+-      })
+-    ),
++    accessUrl: accessKeyPrefix ? `${accessUrl}&prefix=${accessKeyPrefix}` : accessUrl,
+   };
+ }
+ 
+@@ -273,7 +274,8 @@ export class ShadowsocksManagerService {
+     private accessKeys: AccessKeyRepository,
+     private shadowsocksServer: ShadowsocksServer,
+     private managerMetrics: ManagerMetrics,
+-    private metricsPublisher: SharedMetricsPublisher
++    private metricsPublisher: SharedMetricsPublisher,
++    private accessKeyPrefix: string = ''
+   ) {}
+ 
+   renameServer(req: RequestType, res: ResponseType, next: restify.Next): void {
+@@ -357,7 +359,7 @@ export class ShadowsocksManagerService {
+       logging.debug(`getAccessKey request ${JSON.stringify(req.params)}`);
+       const accessKeyId = validateAccessKeyId(req.params.id);
+       const accessKey = this.accessKeys.getAccessKey(accessKeyId);
+-      const accessKeyJson = accessKeyToApiJson(accessKey);
++      const accessKeyJson = accessKeyToApiJson(accessKey, this.accessKeyPrefix);
+ 
+       logging.debug(`getAccessKey response ${JSON.stringify(accessKeyJson)}`);
+       res.send(HttpSuccess.OK, accessKeyJson);
+@@ -376,7 +378,7 @@ export class ShadowsocksManagerService {
+     logging.debug(`listAccessKeys request ${JSON.stringify(req.params)}`);
+     const response = {accessKeys: []};
+     for (const accessKey of this.accessKeys.listAccessKeys()) {
+-      response.accessKeys.push(accessKeyToApiJson(accessKey));
++      response.accessKeys.push(accessKeyToApiJson(accessKey, this.accessKeyPrefix));
+     }
+     logging.debug(`listAccessKeys response ${JSON.stringify(response)}`);
+     res.send(HttpSuccess.OK, response);
+@@ -399,7 +401,8 @@ export class ShadowsocksManagerService {
+           dataLimit,
+           password,
+           portNumber,
+-        })
++        }),
++        this.accessKeyPrefix
+       );
+       return accessKeyJson;
+     } catch (error) {
+diff --git a/src/shadowbox/server/outline_shadowsocks_server.ts b/src/shadowbox/server/outline_shadowsocks_server.ts
+index e7c4037..35f7096 100644
+--- a/src/shadowbox/server/outline_shadowsocks_server.ts
++++ b/src/shadowbox/server/outline_shadowsocks_server.ts
+@@ -118,6 +118,9 @@ export class OutlineShadowsocksServer implements ShadowsocksServer {
+     if (this.isReplayProtectionEnabled) {
+       commandArguments.push('--replay_history=10000');
+     }
++    if (process.env.SB_ALLOW_PRIVATE_TARGETS === 'true') {
++      commandArguments.push('--allow_private_targets');
++    }
+     logging.info('======== Starting Outline Shadowsocks Service ========');
+     logging.info(`${this.binaryFilename} ${commandArguments.map((a) => `"${a}"`).join(' ')}`);
+     this.ssProcess = child_process.spawn(this.binaryFilename, commandArguments);
+diff --git a/outline_patch_tests/private_targets_test.go b/outline_patch_tests/private_targets_test.go
+new file mode 100644
+index 0000000..ebdd0d1
+--- /dev/null
++++ b/outline_patch_tests/private_targets_test.go
+@@ -0,0 +1,21 @@
++package outlinepatchtests
++
++import (
++	"net"
++	"testing"
++
++	onet "github.com/Jigsaw-Code/outline-ss-server/net"
++)
++
++func TestPrivateTargetPolicy(t *testing.T) {
++	privateIP := net.ParseIP("192.168.1.10")
++	if err := onet.RequirePublicIP(privateIP); err == nil {
++		t.Fatal("upstream public-only policy unexpectedly accepted a private IP")
++	}
++	if err := onet.RequireGlobalUnicastIP(privateIP); err != nil {
++		t.Fatalf("LAN policy rejected a private unicast IP: %v", err)
++	}
++	if err := onet.RequireGlobalUnicastIP(net.ParseIP("127.0.0.1")); err == nil {
++		t.Fatal("LAN policy must continue to reject loopback targets")
++	}
++}

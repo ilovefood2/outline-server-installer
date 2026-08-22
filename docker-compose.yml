@@ -1,0 +1,43 @@
+# Optional Compose-based run for an already-built ARM Outline image.
+# Prefer ./install.sh for a full Manager-compatible setup (certs, API prefix, watchtower).
+#
+# This file is useful when you already have:
+#   - a built image (localhost/outline/shadowbox:stable)
+#   - TLS cert/key and state dir created by install_server.sh
+#
+# Example (after a normal install):
+#   docker compose up -d
+#
+# Environment can be overridden via config/outline.env
+
+services:
+  shadowbox:
+    image: ${SB_IMAGE:-localhost/outline/shadowbox:stable}
+    container_name: shadowbox
+    restart: always
+    network_mode: host
+    labels:
+      - com.centurylinklabs.watchtower.enable=true
+    logging:
+      driver: local
+    volumes:
+      - ${SHADOWBOX_DIR:-/opt/outline}/persisted-state:${SHADOWBOX_DIR:-/opt/outline}/persisted-state
+    environment:
+      SB_STATE_DIR: ${SHADOWBOX_DIR:-/opt/outline}/persisted-state
+      SB_ACCESS_KEY_PREFIX: ${SB_ACCESS_KEY_PREFIX:-POST%20}
+      SB_ALLOW_PRIVATE_TARGETS: ${SB_ALLOW_PRIVATE_TARGETS:-true}
+      SB_API_PORT: ${SB_API_PORT:?set SB_API_PORT in config/outline.env}
+      SB_API_PREFIX: ${SB_API_PREFIX:?set SB_API_PREFIX in config/outline.env}
+      SB_CERTIFICATE_FILE: ${SHADOWBOX_DIR:-/opt/outline}/persisted-state/shadowbox-selfsigned.crt
+      SB_PRIVATE_KEY_FILE: ${SHADOWBOX_DIR:-/opt/outline}/persisted-state/shadowbox-selfsigned.key
+      SB_METRICS_URL: ${SB_METRICS_URL:-}
+
+  watchtower:
+    image: nickfedor/watchtower:latest
+    container_name: watchtower
+    restart: always
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    logging:
+      driver: local
+    command: --cleanup --label-enable --tlsverify --interval 3600

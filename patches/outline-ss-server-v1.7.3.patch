@@ -1,0 +1,217 @@
+diff --git a/vendor/github.com/Jigsaw-Code/outline-ss-server/net/private_net.go b/vendor/github.com/Jigsaw-Code/outline-ss-server/net/private_net.go
+index eb69cbe..ed83614 100644
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/net/private_net.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/net/private_net.go
+@@ -50,11 +50,21 @@ func IsPrivateAddress(ip net.IP) bool {
+ // TargetIPValidator is a type alias for checking if an IP is allowed.
+ type TargetIPValidator = func(net.IP) error
+ 
++// RequireGlobalUnicastIP returns an error if the destination IP cannot be
++// routed as ordinary unicast traffic. Unlike RequirePublicIP, RFC1918 and ULA
++// addresses are accepted so an explicitly configured server can reach its LAN.
++func RequireGlobalUnicastIP(ip net.IP) error {
++	if !ip.IsGlobalUnicast() {
++		return NewConnectionError("ERR_ADDRESS_INVALID", fmt.Sprintf("Address is not global unicast: %s", ip.String()), nil)
++	}
++	return nil
++}
++
+ // RequirePublicIP returns an error if the destination IP is not a
+ // standard public IP.
+ func RequirePublicIP(ip net.IP) error {
+-	if !ip.IsGlobalUnicast() {
+-		return NewConnectionError("ERR_ADDRESS_INVALID", fmt.Sprintf("Address is not global unicast: %s", ip.String()), nil)
++	if err := RequireGlobalUnicastIP(ip); err != nil {
++		return err
+ 	}
+ 	if IsPrivateAddress(ip) {
+ 		return NewConnectionError("ERR_ADDRESS_PRIVATE", fmt.Sprintf("Address is private: %s", ip.String()), nil)
+diff --git a/vendor/github.com/Jigsaw-Code/outline-ss-server/service/shadowsocks.go b/vendor/github.com/Jigsaw-Code/outline-ss-server/service/shadowsocks.go
+index 636fa94..49ef278 100644
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/service/shadowsocks.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/service/shadowsocks.go
+@@ -21,6 +21,7 @@ import (
+ 	"time"
+ 
+ 	"github.com/Jigsaw-Code/outline-sdk/transport"
++	onet "github.com/Jigsaw-Code/outline-ss-server/net"
+ )
+ 
+ const (
+@@ -51,11 +52,12 @@ type Service interface {
+ type Option func(s *ssService)
+ 
+ type ssService struct {
+-	logger      *slog.Logger
+-	metrics     ServiceMetrics
+-	ciphers     CipherList
+-	natTimeout  time.Duration
+-	replayCache *ReplayCache
++	logger            *slog.Logger
++	metrics           ServiceMetrics
++	ciphers           CipherList
++	natTimeout        time.Duration
++	replayCache       *ReplayCache
++	targetIPValidator onet.TargetIPValidator
+ 
+ 	sh StreamHandler
+ 	ph PacketHandler
+@@ -87,6 +89,10 @@ func NewShadowsocksService(opts ...Option) (Service, error) {
+ 
+ 	s.ph = NewPacketHandler(s.natTimeout, s.ciphers, s.metrics, &ssConnMetrics{ServiceMetrics: s.metrics, proto: "udp"})
+ 	s.ph.SetLogger(s.logger)
++	if s.targetIPValidator != nil {
++		s.sh.SetTargetDialer(makeValidatingTCPStreamDialer(s.targetIPValidator))
++		s.ph.SetTargetIPValidator(s.targetIPValidator)
++	}
+ 
+ 	return s, nil
+ }
+@@ -127,6 +133,13 @@ func WithNatTimeout(natTimeout time.Duration) Option {
+ 	}
+ }
+ 
++// WithTargetIPValidator overrides the default public-IP-only target policy.
++func WithTargetIPValidator(targetIPValidator onet.TargetIPValidator) Option {
++	return func(s *ssService) {
++		s.targetIPValidator = targetIPValidator
++	}
++}
++
+ // HandleStream handles a Shadowsocks stream-based connection.
+ func (s *ssService) HandleStream(ctx context.Context, conn transport.StreamConn) {
+ 	var connMetrics TCPConnMetrics
+diff --git a/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go b/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go
+index 3a04af0..dabd40c 100644
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go
+@@ -29,6 +29,7 @@ import (
+ 
+ 	"github.com/Jigsaw-Code/outline-sdk/transport/shadowsocks"
+ 	"github.com/Jigsaw-Code/outline-ss-server/ipinfo"
++	onet "github.com/Jigsaw-Code/outline-ss-server/net"
+ 	outline_prometheus "github.com/Jigsaw-Code/outline-ss-server/prometheus"
+ 	"github.com/Jigsaw-Code/outline-ss-server/service"
+ 	"github.com/lmittmann/tint"
+@@ -57,12 +58,13 @@ func init() {
+ }
+ 
+ type OutlineServer struct {
+-	stopConfig     func() error
+-	lnManager      service.ListenerManager
+-	natTimeout     time.Duration
+-	serverMetrics  *serverMetrics
+-	serviceMetrics service.ServiceMetrics
+-	replayCache    service.ReplayCache
++	stopConfig          func() error
++	lnManager           service.ListenerManager
++	natTimeout          time.Duration
++	serverMetrics       *serverMetrics
++	serviceMetrics      service.ServiceMetrics
++	replayCache         service.ReplayCache
++	allowPrivateTargets bool
+ }
+ 
+ func (s *OutlineServer) loadConfig(filename string) error {
+@@ -219,13 +221,17 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
+ 				ciphers := service.NewCipherList()
+ 				ciphers.Update(cipherList)
+ 
+-				ssService, err := service.NewShadowsocksService(
++				serviceOptions := []service.Option{
+ 					service.WithCiphers(ciphers),
+ 					service.WithNatTimeout(s.natTimeout),
+ 					service.WithMetrics(s.serviceMetrics),
+ 					service.WithReplayCache(&s.replayCache),
+ 					service.WithLogger(slog.Default()),
+-				)
++				}
++				if s.allowPrivateTargets {
++					serviceOptions = append(serviceOptions, service.WithTargetIPValidator(onet.RequireGlobalUnicastIP))
++				}
++				ssService, err := service.NewShadowsocksService(serviceOptions...)
+ 				ln, err := lnSet.ListenStream(addr)
+ 				if err != nil {
+ 					return err
+@@ -246,13 +252,17 @@ func (s *OutlineServer) runConfig(config Config) (func() error, error) {
+ 				if err != nil {
+ 					return fmt.Errorf("failed to create cipher list from config: %v", err)
+ 				}
+-				ssService, err := service.NewShadowsocksService(
++				serviceOptions := []service.Option{
+ 					service.WithCiphers(ciphers),
+ 					service.WithNatTimeout(s.natTimeout),
+ 					service.WithMetrics(s.serviceMetrics),
+ 					service.WithReplayCache(&s.replayCache),
+ 					service.WithLogger(slog.Default()),
+-				)
++				}
++				if s.allowPrivateTargets {
++					serviceOptions = append(serviceOptions, service.WithTargetIPValidator(onet.RequireGlobalUnicastIP))
++				}
++				ssService, err := service.NewShadowsocksService(serviceOptions...)
+ 				if err != nil {
+ 					return err
+ 				}
+@@ -314,13 +324,14 @@ func (s *OutlineServer) Stop() error {
+ }
+ 
+ // RunOutlineServer starts an Outline server running, and returns the server or an error.
+-func RunOutlineServer(filename string, natTimeout time.Duration, serverMetrics *serverMetrics, serviceMetrics service.ServiceMetrics, replayHistory int) (*OutlineServer, error) {
++func RunOutlineServer(filename string, natTimeout time.Duration, serverMetrics *serverMetrics, serviceMetrics service.ServiceMetrics, replayHistory int, allowPrivateTargets bool) (*OutlineServer, error) {
+ 	server := &OutlineServer{
+-		lnManager:      service.NewListenerManager(),
+-		natTimeout:     natTimeout,
+-		serverMetrics:  serverMetrics,
+-		serviceMetrics: serviceMetrics,
+-		replayCache:    service.NewReplayCache(replayHistory),
++		lnManager:           service.NewListenerManager(),
++		natTimeout:          natTimeout,
++		serverMetrics:       serverMetrics,
++		serviceMetrics:      serviceMetrics,
++		replayCache:         service.NewReplayCache(replayHistory),
++		allowPrivateTargets: allowPrivateTargets,
+ 	}
+ 	err := server.loadConfig(filename)
+ 	if err != nil {
+@@ -343,14 +354,15 @@ func main() {
+ 	slog.SetDefault(slog.New(logHandler))
+ 
+ 	var flags struct {
+-		ConfigFile    string
+-		MetricsAddr   string
+-		IPCountryDB   string
+-		IPASNDB       string
+-		natTimeout    time.Duration
+-		replayHistory int
+-		Verbose       bool
+-		Version       bool
++		ConfigFile          string
++		MetricsAddr         string
++		IPCountryDB         string
++		IPASNDB             string
++		natTimeout          time.Duration
++		replayHistory       int
++		AllowPrivateTargets bool
++		Verbose             bool
++		Version             bool
+ 	}
+ 	flag.StringVar(&flags.ConfigFile, "config", "", "Configuration filename")
+ 	flag.StringVar(&flags.MetricsAddr, "metrics", "", "Address for the Prometheus metrics")
+@@ -358,6 +370,7 @@ func main() {
+ 	flag.StringVar(&flags.IPASNDB, "ip_asn_db", "", "Path to the ip-to-ASN mmdb file")
+ 	flag.DurationVar(&flags.natTimeout, "udptimeout", defaultNatTimeout, "UDP tunnel timeout")
+ 	flag.IntVar(&flags.replayHistory, "replay_history", 0, "Replay buffer size (# of handshakes)")
++	flag.BoolVar(&flags.AllowPrivateTargets, "allow_private_targets", false, "Allow proxy targets on private LAN address ranges")
+ 	flag.BoolVar(&flags.Verbose, "verbose", false, "Enables verbose logging output")
+ 	flag.BoolVar(&flags.Version, "version", false, "The version of the server")
+ 
+@@ -407,7 +420,7 @@ func main() {
+ 	r := prometheus.WrapRegistererWithPrefix("shadowsocks_", prometheus.DefaultRegisterer)
+ 	r.MustRegister(serverMetrics, serviceMetrics)
+ 
+-	_, err = RunOutlineServer(flags.ConfigFile, flags.natTimeout, serverMetrics, serviceMetrics, flags.replayHistory)
++	_, err = RunOutlineServer(flags.ConfigFile, flags.natTimeout, serverMetrics, serviceMetrics, flags.replayHistory, flags.AllowPrivateTargets)
+ 	if err != nil {
+ 		slog.Error("Server failed to start. Aborting.", "err", err)
+ 	}
