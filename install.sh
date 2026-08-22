@@ -104,6 +104,19 @@ esac
 REAL_USER="${SUDO_USER:-root}"
 REAL_HOME="$(getent passwd "${REAL_USER}" | cut -d: -f6 || echo /root)"
 
+prepare_build_workspace() {
+  # Bootstrap installs live under /opt and are initially root-owned. The build
+  # deliberately runs as the invoking Docker user, so give that user ownership
+  # of only the generated build cache—not the installer itself.
+  if [[ "${REAL_USER}" != "root" ]] && id -nG "${REAL_USER}" 2>/dev/null | grep -qw docker; then
+    local build_workspace="${SCRIPT_DIR}/.build"
+    local user_group
+    user_group="$(id -gn "${REAL_USER}")"
+    mkdir -p "${build_workspace}"
+    chown -R "${REAL_USER}:${user_group}" "${build_workspace}"
+  fi
+}
+
 log "Outline Server"
 echo "    Architecture : ${ARCH}"
 echo "    Image        : ${IMAGE_TAG}"
@@ -154,6 +167,7 @@ else
   # Run build as the real user when possible so files aren't all root-owned,
   # but docker needs group access — use root if user not in docker group yet.
   export PATH="/usr/local/go/bin:/usr/local/bin:${PATH}"
+  prepare_build_workspace
   if [[ "${REAL_USER}" != "root" ]] && id -nG "${REAL_USER}" 2>/dev/null | grep -qw docker; then
     sudo -u "${REAL_USER}" -H \
       env PATH="/usr/local/go/bin:/usr/local/bin:${PATH}" \
