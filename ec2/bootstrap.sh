@@ -3,12 +3,12 @@
 # Version-pinned HTTPS bootstrap for the AWS EC2 x86_64 installer.
 #
 # Run:
-#   sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/ilovefood2/outline-server-installer/v1.12.3-r1/ec2/bootstrap.sh)" -- --hostname <ELASTIC_IP_OR_DNS>
+#   sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/ilovefood2/outline-server-installer/v1.12.3-r2/ec2/bootstrap.sh)" -- --hostname <ELASTIC_IP_OR_DNS>
 #
 set -euo pipefail
 
 REPOSITORY="ilovefood2/outline-server-installer"
-RELEASE_REF="v1.12.3-r1"
+RELEASE_REF="v1.12.3-r2"
 ARCHIVE_URL="https://github.com/${REPOSITORY}/archive/refs/tags/${RELEASE_REF}.tar.gz"
 INSTALL_DIR="${OUTLINE_INSTALL_DIR:-/opt/outline-server-installer-${RELEASE_REF}}"
 
@@ -56,7 +56,8 @@ else
 fi
 
 tar -xzf "${ARCHIVE_FILE}" -C "${WORK_DIR}"
-SOURCE_DIR="${WORK_DIR}/outline-server-installer-${RELEASE_REF}"
+SOURCE_DIR="$(find "${WORK_DIR}" -mindepth 1 -maxdepth 1 -type d -name 'outline-server-installer-*' -print -quit)"
+[[ -n "${SOURCE_DIR}" ]] || die "Downloaded release did not contain an installer directory."
 [[ -x "${SOURCE_DIR}/ec2/install.sh" ]] || die "Downloaded release is missing ec2/install.sh."
 
 mv "${SOURCE_DIR}" "${INSTALL_DIR}"
