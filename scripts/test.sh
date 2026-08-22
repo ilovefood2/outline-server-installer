@@ -23,9 +23,11 @@ grep -Fq 'declare FLAGS_PREFIX="POST%20"' "${ROOT_DIR}/scripts/install_server.sh
 grep -Fq 'SB_ALLOW_PRIVATE_TARGETS=true' "${ROOT_DIR}/install.sh"
 grep -Fq 'TASK_ARCH="arm64"' "${ROOT_DIR}/scripts/build_image.sh"
 grep -Fq 'TARGET_ARCH="${TASK_ARCH}"' "${ROOT_DIR}/scripts/build_image.sh"
+grep -Fq 'package_install curl-minimal' "${ROOT_DIR}/scripts/setup_build_deps.sh"
+grep -Fq 'package_install gnupg2-minimal' "${ROOT_DIR}/scripts/setup_build_deps.sh"
 bash "${ROOT_DIR}/scripts/install_server.sh" --help | grep -Fq 'default: 80'
 bash "${ROOT_DIR}/ec2/install.sh" --help | grep -Fq -- '--api-port 443'
-bash "${ROOT_DIR}/ec2/bootstrap.sh" --help | grep -Fq 'Outline Server EC2 bootstrap (v1.12.3-r2)'
+bash "${ROOT_DIR}/ec2/bootstrap.sh" --help | grep -Fq 'Outline Server EC2 bootstrap (v1.12.3-r3)'
 
 bash "${ROOT_DIR}/scripts/apply_outline_patches.sh" "${SOURCE_DIR}"
 

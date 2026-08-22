@@ -48,7 +48,15 @@ log "Installing base packages..."
 if [[ "${PACKAGE_FAMILY}" == "deb" ]]; then
   package_install ca-certificates curl git build-essential python3 openssl gnupg
 else
-  package_install ca-certificates curl git gcc gcc-c++ make python3 openssl gnupg2 tar gzip
+  # Amazon Linux 2023 includes curl-minimal and gnupg2-minimal by default.
+  # Installing their full variants causes DNF to request a conflicting erase.
+  package_install ca-certificates git gcc gcc-c++ make python3 openssl tar gzip
+  if ! command -v curl >/dev/null 2>&1; then
+    package_install curl-minimal
+  fi
+  if ! command -v gpg >/dev/null 2>&1 && ! command -v gpg2 >/dev/null 2>&1; then
+    package_install gnupg2-minimal
+  fi
 fi
 
 # --- Node.js 18 (NodeSource) ---

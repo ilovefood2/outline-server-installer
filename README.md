@@ -7,7 +7,7 @@ For an AWS EC2 x86_64 deployment, see [ec2/README.md](ec2/README.md) and use `su
 The public EC2 bootstrap command is:
 
 ```bash
-sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/ilovefood2/outline-server-installer/v1.12.3-r2/ec2/bootstrap.sh)" -- --hostname YOUR_ELASTIC_IP_OR_DNS
+sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/ilovefood2/outline-server-installer/v1.12.3-r3/ec2/bootstrap.sh)" -- --hostname YOUR_ELASTIC_IP_OR_DNS
 ```
 
 Official `quay.io/outline/shadowbox` images are **x86_64 only**, and the official installer refuses non-x86 hosts. This project:

@@ -38,10 +38,10 @@ For VPC targets, their security groups must also allow traffic from this EC2 ins
 For a new EC2 instance, use the version-pinned one-line installer:
 
 ```bash
-sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/ilovefood2/outline-server-installer/v1.12.3-r2/ec2/bootstrap.sh)" -- --hostname YOUR_ELASTIC_IP_OR_DNS
+sudo bash -c "$(wget -qO- https://raw.githubusercontent.com/ilovefood2/outline-server-installer/v1.12.3-r3/ec2/bootstrap.sh)" -- --hostname YOUR_ELASTIC_IP_OR_DNS
 ```
 
-It downloads the tagged source to `/opt/outline-server-installer-v1.12.3-r2`, then starts the EC2 installer. Arguments after `--` are forwarded to `ec2/install.sh`.
+It downloads the tagged source to `/opt/outline-server-installer-v1.12.3-r3`, then starts the EC2 installer. Arguments after `--` are forwarded to `ec2/install.sh`.
 
 Alternatively, copy the EC2 installer archive to the instance and run:
 
