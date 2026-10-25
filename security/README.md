@@ -50,7 +50,9 @@ For the exact IPv4/IPv6 firewall packet test, build the disposable test image fr
 
 ## Deployment and rollback
 
-This installer is deliberately restricted to the verified Pi address `10.0.0.33`, its original state layout and its existing POST/LAN policy. It requires a private root-owned backup, a completed package upgrade receipt and a clean `dpkg --audit`. Install `python3-yaml`, `nftables` and `unattended-upgrades` through the existing trusted Debian repositories first.
+This installer is deliberately restricted to the verified Pi address `10.0.0.33`, its original state layout and its existing POST/LAN policy. It requires a private root-owned backup, a completed package upgrade receipt and a clean `dpkg --audit`. Install `python3-yaml`, `nftables`, `rsync` and `unattended-upgrades` through the existing trusted Debian repositories first.
+
+The state is copied online into an owned, marked staging directory, preserving Prometheus snapshot hard links. The server then stops for a final exact delta sync and cutover. Vanished source files are tolerated only during the online pass; any partial final transfer aborts. No links are shared between the original rollback state and the new live state.
 
 Transfer a root-private bundle over SSH containing the installer, firewall and service files, the Docker image export, the rebuilt MediaMTX binary as `mediamtx`, and a manifest with `image_tag`, exact `image_id` and `image_config_id`, `backend_sha256`, and a `files` SHA-256 map for every payload file. The two IDs accommodate Docker's containerd and classic image stores; both must come from the same tested export. Verify the full bundle checksum before extraction. Never put production keys, environment files or pairing certificates in a distributable bundle or Git.
 

@@ -1,8 +1,11 @@
 """Host migration checks without production credentials or host mutations."""
 import copy
 import unittest
+from unittest.mock import patch
+import subprocess
+from pathlib import Path
 
-from install_on_pi import secure_media_config
+from install_on_pi import secure_media_config, sync_state
 
 
 class MediaConfigTest(unittest.TestCase):
@@ -44,6 +47,19 @@ class MediaConfigTest(unittest.TestCase):
             secure_media_config(data)
         self.assertEqual(data, original)
 
+
+class StateSyncTest(unittest.TestCase):
+    def test_only_online_copy_accepts_vanished_files(self):
+        with patch('install_on_pi.subprocess.run', return_value=subprocess.CompletedProcess([], 24)):
+            sync_state(Path('/fixture'), live=True)
+            with self.assertRaises(RuntimeError):
+                sync_state(Path('/fixture'))
+
+    def test_partial_transfer_always_aborts(self):
+        with patch('install_on_pi.subprocess.run', return_value=subprocess.CompletedProcess([], 23)):
+            for live in (False, True):
+                with self.assertRaises(RuntimeError):
+                    sync_state(Path('/fixture'), live=live)
 
 if __name__ == '__main__':
     unittest.main()

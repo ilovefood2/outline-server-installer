@@ -49,6 +49,14 @@ def key_identity(directory):
     return config
 
 
+def sync_state(staging, live=False):
+    copied = subprocess.run(['rsync', '--archive', '--hard-links', '--delete', '--no-whole-file', '--',
+                             str(STATE) + '/', str(staging) + '/'], capture_output=True)
+    # TSDB compaction can remove files during the online copy; the frozen sync must be exact.
+    if copied.returncode not in ((0, 24) if live else (0,)):
+        raise RuntimeError('State synchronization failed with exit ' + str(copied.returncode))
+
+
 def manager_request(environment, directory, path):
     certificate = directory / Path(environment['SB_CERTIFICATE_FILE']).name
     context = ssl.create_default_context(cafile=str(certificate))
@@ -102,11 +110,27 @@ def install_image(backup, manifest):
     allowed_ids = {manifest['image_id'], manifest['image_config_id']}
     if image['Architecture'] != 'arm64' or image['Os'] != 'linux' or image['Id'] not in allowed_ids:
         raise RuntimeError('Wrong image identity or architecture')
+    staging = backup / 'outline-state-staging'
+    marker = backup / 'outline-state-staging.json'
+    expected_marker = {'source': str(STATE), 'original_image': old['Image']}
+    if staging.exists():
+        if staging.is_symlink() or not marker.exists() or json.loads(marker.read_text()) != expected_marker:
+            raise RuntimeError('Unrecognized state staging directory')
+    else:
+        staging.mkdir(mode=0o700)
+        private_write(marker, json.dumps(expected_marker) + '\n')
+    sync_state(staging, live=True)
     renamed = False
     try:
         run(['docker', 'update', '--restart=no', 'shadowbox'])
         run(['docker', 'stop', '--time', '25', 'shadowbox'], timeout=40)
-        shutil.copytree(STATE, SECURE_STATE, symlinks=True)
+        identity = key_identity(STATE)
+        server_before = json.loads((STATE / 'shadowbox_server_config.json').read_text())
+        certificate_before = digest(STATE / certificate_name)
+        environment['SB_PUBLIC_IP'] = server_before['hostname']
+        private_write(env_file, ''.join(name + '=' + value + '\n' for name, value in environment.items()))
+        sync_state(staging)
+        staging.rename(SECURE_STATE)
         # Root startup scripts must remain outside application-writable state.
         startup = SECURE_STATE / 'start_container.sh'
         if startup.exists():
