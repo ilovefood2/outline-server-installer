@@ -1,0 +1,21 @@
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go
+@@ -423,9 +423,18 @@
+ 	_, err = RunOutlineServer(flags.ConfigFile, flags.natTimeout, serverMetrics, serviceMetrics, flags.replayHistory, flags.AllowPrivateTargets)
+ 	if err != nil {
+ 		slog.Error("Server failed to start. Aborting.", "err", err)
++		os.Exit(1)
+ 	}
+ 
+ 	sigCh := make(chan os.Signal, 1)
+ 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
++	if os.Getenv("OUTLINE_ROUTER_READY") == "1" {
++		ready := os.NewFile(3, "outline-router-ready")
++		if _, err := ready.Write([]byte("ready\n")); err != nil {
++			slog.Error("Failed to report router readiness", "err", err)
++			os.Exit(1)
++		}
++		ready.Close()
++	}
+ 	<-sigCh
+ }

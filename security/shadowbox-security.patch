@@ -1,0 +1,501 @@
+--- a/src/shadowbox/server/main.ts
++++ b/src/shadowbox/server/main.ts
+@@ -18,7 +18,6 @@
+ import * as process from 'process';
+ import * as prometheus from 'prom-client';
+ import * as restify from 'restify';
+-import * as corsMiddleware from 'restify-cors-middleware2';
+ 
+ import {RealClock} from '../infrastructure/clock';
+ import {PortProvider} from '../infrastructure/get_port';
+@@ -239,24 +238,32 @@
+   });
+ 
+   // Pre-routing handlers
+-  const cors = corsMiddleware({
+-    origins: ['*'],
+-    allowHeaders: [],
+-    exposeHeaders: [],
+-    credentials: false,
+-  });
+-  apiServer.pre(cors.preflight);
++  apiServer.pre((req, res, next) => {
++    res.header('Access-Control-Allow-Origin', '*');
++    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
++    res.header('Access-Control-Allow-Headers', 'Content-Type');
++    if (req.method === 'OPTIONS') {
++      res.send(204);
++      return next(false);
++    }
++    return next();
++  });
+   apiServer.pre(restify.pre.sanitizePath());
+ 
+   // All routes handlers
+   const apiPrefix = process.env.SB_API_PREFIX ? `/${process.env.SB_API_PREFIX}` : '';
+   apiServer.use(restify.plugins.jsonp());
+-  apiServer.use(restify.plugins.bodyParser({mapParams: true}));
+-  apiServer.use(cors.actual);
++  apiServer.use(restify.plugins.queryParser({mapParams: false}));
++  apiServer.use(restify.plugins.bodyParser({mapParams: true, maxBodySize: 65536}));
+   bindService(apiServer, apiPrefix, managerService);
+ 
+-  apiServer.listen(apiPortNumber, () => {
+-    logging.info(`Manager listening at ${apiServer.url}${apiPrefix}`);
++  apiServer.server.maxConnections = 64;
++  apiServer.server.maxHeadersCount = 64;
++  apiServer.server.headersTimeout = 10000;
++  apiServer.server.requestTimeout = 15000;
++  apiServer.server.keepAliveTimeout = 5000;
++  apiServer.listen(apiPortNumber, process.env.SB_API_ADDRESS || '127.0.0.1', () => {
++    logging.info(`Manager listening on port ${apiPortNumber}`);
+   });
+ 
+   await accessKeyRepository.start(new RealClock());
+--- a/src/shadowbox/server/outline_shadowsocks_server.ts
++++ b/src/shadowbox/server/outline_shadowsocks_server.ts
+@@ -13,6 +13,7 @@
+ // limitations under the License.
+ 
+ import * as child_process from 'child_process';
++import {createHash} from 'crypto';
+ import * as jsyaml from 'js-yaml';
+ import * as mkdirp from 'mkdirp';
+ import * as path from 'path';
+@@ -24,6 +25,9 @@
+ // Runs outline-ss-server.
+ export class OutlineShadowsocksServer implements ShadowsocksServer {
+   private ssProcess: child_process.ChildProcess;
++  private updates = Promise.resolve();
++  private replyBuffer = '';
++  private pendingReply?: {expected: string; finish: (error?: Error) => void};
+   private ipCountryFilename?: string;
+   private ipAsnFilename?: string;
+   private isAsnMetricsEnabled = false;
+@@ -65,23 +69,59 @@
+     return this;
+   }
+ 
+-  // Promise is resolved after the outline-ss-config config is updated and the SIGHUP sent.
+-  // Keys may not be active yet.
+-  // TODO(fortuna): Make promise resolve when keys are ready.
++  // Report key changes only after the backend applies that exact configuration.
+   update(keys: ShadowsocksAccessKey[]): Promise<void> {
+-    return this.writeConfigFile(keys).then(() => {
++    const snapshot = keys.map((key) => ({...key}));
++    const update = this.updates.then(async () => {
++      const digest = await this.writeConfigFile(snapshot);
+       if (!this.ssProcess) {
+-        this.start();
+-        return Promise.resolve();
++        await this.waitForReply('ready', () => this.start());
+       } else {
+-        this.ssProcess.kill('SIGHUP');
++        await this.waitForReply(`reloaded ${digest}`, () => {
++          if (!this.ssProcess.kill('SIGHUP')) throw new Error('Backend reload signal failed');
++        });
+       }
++    });
++    this.updates = update.catch(() => {});
++    return update;
++  }
++
++  private waitForReply(expected: string, action: () => void): Promise<void> {
++    return new Promise((resolve, reject) => {
++      const timer = setTimeout(() => {
++        this.pendingReply?.finish(new Error('Backend configuration acknowledgement timed out'));
++        this.ssProcess?.kill('SIGKILL');
++      }, 5000);
++      this.pendingReply = {expected, finish: (error?: Error) => {
++        clearTimeout(timer);
++        this.pendingReply = undefined;
++        if (error) reject(error); else resolve();
++      }};
++      try { action(); } catch (error) { this.pendingReply.finish(error as Error); }
+     });
+   }
+ 
+-  private writeConfigFile(keys: ShadowsocksAccessKey[]): Promise<void> {
++  private receiveReply(chunk: Buffer) {
++    this.replyBuffer += chunk.toString('utf8');
++    if (this.replyBuffer.length > 4096) {
++      this.pendingReply?.finish(new Error('Invalid backend acknowledgement'));
++      this.ssProcess.kill('SIGKILL');
++      return;
++    }
++    let end: number;
++    while ((end = this.replyBuffer.indexOf('\n')) !== -1) {
++      const line = this.replyBuffer.slice(0, end);
++      this.replyBuffer = this.replyBuffer.slice(end + 1);
++      if (line === this.pendingReply?.expected) this.pendingReply.finish();
++      else if (line.startsWith('failed ')) {
++        this.pendingReply?.finish(new Error('Backend refused configuration'));
++      }
++    }
++  }
++
++  private writeConfigFile(keys: ShadowsocksAccessKey[]): Promise<string> {
+     return new Promise((resolve, reject) => {
+-      const keysJson = {keys: [] as ShadowsocksAccessKey[]};
++      const keysJson = {keys: [] as Array<ShadowsocksAccessKey & {lan_access: boolean}>};
+       for (const key of keys) {
+         if (!isAeadCipher(key.cipher)) {
+           logging.error(
+@@ -90,14 +130,15 @@
+           continue;
+         }
+ 
+-        keysJson.keys.push(key);
++        keysJson.keys.push({...key, lan_access: process.env.SB_ALLOW_PRIVATE_TARGETS === 'true'});
+       }
+ 
+       mkdirp.sync(path.dirname(this.configFilename));
+ 
+       try {
+-        file.atomicWriteFileSync(this.configFilename, jsyaml.safeDump(keysJson, {sortKeys: true}));
+-        resolve();
++        const data = jsyaml.safeDump(keysJson, {sortKeys: true});
++        file.atomicWriteFileSync(this.configFilename, data);
++        resolve(createHash('sha256').update(data).digest('hex'));
+       } catch (error) {
+         reject(error);
+       }
+@@ -123,14 +164,21 @@
+     }
+     logging.info('======== Starting Outline Shadowsocks Service ========');
+     logging.info(`${this.binaryFilename} ${commandArguments.map((a) => `"${a}"`).join(' ')}`);
+-    this.ssProcess = child_process.spawn(this.binaryFilename, commandArguments);
++    this.replyBuffer = '';
++    this.ssProcess = child_process.spawn(this.binaryFilename, commandArguments, {
++      env: {...process.env, OUTLINE_ROUTER_READY: '1'},
++      stdio: ['ignore', 'pipe', 'pipe', 'pipe'],
++    });
++    this.ssProcess.stdio[3].on('data', (chunk: Buffer) => this.receiveReply(chunk));
+     this.ssProcess.on('error', (error) => {
+       logging.error(`Error spawning outline-ss-server: ${error}`);
++      this.pendingReply?.finish(error);
++      process.exit(1);
+     });
+     this.ssProcess.on('exit', (code, signal) => {
+       logging.info(`outline-ss-server has exited with error. Code: ${code}, Signal: ${signal}`);
+-      logging.info('Restarting');
+-      this.start();
++      this.pendingReply?.finish(new Error('Backend exited before acknowledgement'));
++      process.exit(1);
+     });
+     // This exposes the outline-ss-server output on the docker logs.
+     // TODO(fortuna): Consider saving the output and expose it through the manager service.
+--- a/src/shadowbox/server/manager_service.ts
++++ b/src/shadowbox/server/manager_service.ts
+@@ -16,7 +16,6 @@
+ import * as ipRegex from 'ip-regex';
+ import * as restify from 'restify';
+ import * as restifyErrors from 'restify-errors';
+-import {makeConfig, SIP002_URI} from 'outline-shadowsocksconfig';
+ 
+ import {JsonConfig} from '../infrastructure/json_config';
+ import * as logging from '../infrastructure/logging';
+@@ -44,15 +43,11 @@
+ 
+ // Creates an AccessKey response. accessKeyPrefix must already be URL-encoded.
+ function accessKeyToApiJson(accessKey: AccessKey, accessKeyPrefix: string): AccessKeyJson {
+-  const accessUrl = SIP002_URI.stringify(
+-    makeConfig({
+-      host: accessKey.proxyParams.hostname,
+-      port: accessKey.proxyParams.portNumber,
+-      method: accessKey.proxyParams.encryptionMethod,
+-      password: accessKey.proxyParams.password,
+-      outline: 1,
+-    })
+-  );
++  const {hostname, portNumber, encryptionMethod, password} = accessKey.proxyParams;
++  const host = hostname.includes(':') && !hostname.startsWith('[') ? `[${hostname}]` : hostname;
++  const authority = `${new URL(`http://${host}`).hostname}:${portNumber}`;
++  const credentials = Buffer.from(`${encryptionMethod}:${password}`, 'utf8').toString('base64url');
++  const accessUrl = `ss://${credentials}@${authority}/?outline=1`;
+   return {
+     id: accessKey.id,
+     name: accessKey.name,
+@@ -122,6 +117,14 @@
+   };
+ }
+ 
++// Restify 12 requires callback handlers to be non-async functions.
++function callbackHandler(handler: (req: RequestType, res: ResponseType, next: restify.Next) => void | Promise<void>): restify.RequestHandler {
++  return (req, res, next) => {
++    try { Promise.resolve(handler({params: req.params || {}, query: req.query}, res, next)).catch(next); }
++    catch (error) { next(error); }
++  };
++}
++
+ export function bindService(
+   apiServer: restify.Server,
+   apiPrefix: string,
+@@ -130,45 +133,45 @@
+   // Reject unauthorized requests in constant time before they reach the routing step.
+   apiServer.pre(prefixFilter(apiPrefix));
+ 
+-  apiServer.put(`${apiPrefix}/name`, service.renameServer.bind(service));
+-  apiServer.get(`${apiPrefix}/server`, service.getServer.bind(service));
+-  apiServer.get(`${apiPrefix}/experimental/server/metrics`, service.getServerMetrics.bind(service));
++  apiServer.put(`${apiPrefix}/name`, callbackHandler(service.renameServer.bind(service)));
++  apiServer.get(`${apiPrefix}/server`, callbackHandler(service.getServer.bind(service)));
++  apiServer.get(`${apiPrefix}/experimental/server/metrics`, callbackHandler(service.getServerMetrics.bind(service)));
+   apiServer.put(
+     `${apiPrefix}/server/access-key-data-limit`,
+-    service.setDefaultDataLimit.bind(service)
++    callbackHandler(service.setDefaultDataLimit.bind(service))
+   );
+   apiServer.del(
+     `${apiPrefix}/server/access-key-data-limit`,
+-    service.removeDefaultDataLimit.bind(service)
++    callbackHandler(service.removeDefaultDataLimit.bind(service))
+   );
+   apiServer.put(
+     `${apiPrefix}/server/hostname-for-access-keys`,
+-    service.setHostnameForAccessKeys.bind(service)
++    callbackHandler(service.setHostnameForAccessKeys.bind(service))
+   );
+   apiServer.put(
+     `${apiPrefix}/server/port-for-new-access-keys`,
+-    service.setPortForNewAccessKeys.bind(service)
+-  );
+-
+-  apiServer.post(`${apiPrefix}/access-keys`, service.createNewAccessKey.bind(service));
+-  apiServer.put(`${apiPrefix}/access-keys/:id`, service.createAccessKey.bind(service));
+-  apiServer.get(`${apiPrefix}/access-keys`, service.listAccessKeys.bind(service));
+-
+-  apiServer.get(`${apiPrefix}/access-keys/:id`, service.getAccessKey.bind(service));
+-  apiServer.del(`${apiPrefix}/access-keys/:id`, service.removeAccessKey.bind(service));
+-  apiServer.put(`${apiPrefix}/access-keys/:id/name`, service.renameAccessKey.bind(service));
++    callbackHandler(service.setPortForNewAccessKeys.bind(service))
++  );
++
++  apiServer.post(`${apiPrefix}/access-keys`, callbackHandler(service.createNewAccessKey.bind(service)));
++  apiServer.put(`${apiPrefix}/access-keys/:id`, callbackHandler(service.createAccessKey.bind(service)));
++  apiServer.get(`${apiPrefix}/access-keys`, callbackHandler(service.listAccessKeys.bind(service)));
++
++  apiServer.get(`${apiPrefix}/access-keys/:id`, callbackHandler(service.getAccessKey.bind(service)));
++  apiServer.del(`${apiPrefix}/access-keys/:id`, callbackHandler(service.removeAccessKey.bind(service)));
++  apiServer.put(`${apiPrefix}/access-keys/:id/name`, callbackHandler(service.renameAccessKey.bind(service)));
+   apiServer.put(
+     `${apiPrefix}/access-keys/:id/data-limit`,
+-    service.setAccessKeyDataLimit.bind(service)
++    callbackHandler(service.setAccessKeyDataLimit.bind(service))
+   );
+   apiServer.del(
+     `${apiPrefix}/access-keys/:id/data-limit`,
+-    service.removeAccessKeyDataLimit.bind(service)
+-  );
+-
+-  apiServer.get(`${apiPrefix}/metrics/transfer`, service.getDataUsage.bind(service));
+-  apiServer.get(`${apiPrefix}/metrics/enabled`, service.getShareMetrics.bind(service));
+-  apiServer.put(`${apiPrefix}/metrics/enabled`, service.setShareMetrics.bind(service));
++    callbackHandler(service.removeAccessKeyDataLimit.bind(service))
++  );
++
++  apiServer.get(`${apiPrefix}/metrics/transfer`, callbackHandler(service.getDataUsage.bind(service)));
++  apiServer.get(`${apiPrefix}/metrics/enabled`, callbackHandler(service.getShareMetrics.bind(service)));
++  apiServer.put(`${apiPrefix}/metrics/enabled`, callbackHandler(service.setShareMetrics.bind(service)));
+ 
+   // Experimental APIs.
+ 
+@@ -279,7 +282,7 @@
+   ) {}
+ 
+   renameServer(req: RequestType, res: ResponseType, next: restify.Next): void {
+-    logging.debug(`renameServer request ${JSON.stringify(req.params)}`);
++    logging.debug('renameServer request');
+     const name = req.params.name;
+     if (!name) {
+       return next(
+@@ -356,12 +359,12 @@
+   // Get a access key
+   getAccessKey(req: RequestType, res: ResponseType, next: restify.Next): void {
+     try {
+-      logging.debug(`getAccessKey request ${JSON.stringify(req.params)}`);
++      logging.debug('getAccessKey request');
+       const accessKeyId = validateAccessKeyId(req.params.id);
+       const accessKey = this.accessKeys.getAccessKey(accessKeyId);
+       const accessKeyJson = accessKeyToApiJson(accessKey, this.accessKeyPrefix);
+ 
+-      logging.debug(`getAccessKey response ${JSON.stringify(accessKeyJson)}`);
++      logging.debug('getAccessKey response');
+       res.send(HttpSuccess.OK, accessKeyJson);
+       return next();
+     } catch (error) {
+@@ -375,12 +378,12 @@
+ 
+   // Lists all access keys
+   listAccessKeys(req: RequestType, res: ResponseType, next: restify.Next): void {
+-    logging.debug(`listAccessKeys request ${JSON.stringify(req.params)}`);
++    logging.debug('listAccessKeys request');
+     const response = {accessKeys: []};
+     for (const accessKey of this.accessKeys.listAccessKeys()) {
+       response.accessKeys.push(accessKeyToApiJson(accessKey, this.accessKeyPrefix));
+     }
+-    logging.debug(`listAccessKeys response ${JSON.stringify(response)}`);
++    logging.debug('listAccessKeys response');
+     res.send(HttpSuccess.OK, response);
+     return next();
+   }
+@@ -422,7 +425,7 @@
+   // Creates a new access key
+   async createNewAccessKey(req: RequestType, res: ResponseType, next: restify.Next): Promise<void> {
+     try {
+-      logging.debug(`createNewAccessKey request ${JSON.stringify(req.params)}`);
++      logging.debug('createNewAccessKey request');
+       if (req.params.id) {
+         return next(
+           new restifyErrors.InvalidArgumentError({statusCode: 400}, 'Parameter `id` is not allowed')
+@@ -430,7 +433,7 @@
+       }
+       const accessKeyJson = await this.createAccessKeyFromRequest(req);
+       res.send(201, accessKeyJson);
+-      logging.debug(`createNewAccessKey response ${JSON.stringify(accessKeyJson)}`);
++      logging.debug('createNewAccessKey response');
+       return next();
+     } catch (error) {
+       logging.error(error);
+@@ -444,11 +447,11 @@
+   // Creates an access key with a specific identifier
+   async createAccessKey(req: RequestType, res: ResponseType, next: restify.Next): Promise<void> {
+     try {
+-      logging.debug(`createAccessKey request ${JSON.stringify(req.params)}`);
++      logging.debug('createAccessKey request');
+       const accessKeyId = validateAccessKeyId(req.params.id);
+       const accessKeyJson = await this.createAccessKeyFromRequest(req, accessKeyId);
+       res.send(201, accessKeyJson);
+-      logging.debug(`createAccessKey response ${JSON.stringify(accessKeyJson)}`);
++      logging.debug('createAccessKey response');
+       return next();
+     } catch (error) {
+       logging.error(error);
+@@ -495,11 +498,11 @@
+   }
+ 
+   // Removes an existing access key
+-  removeAccessKey(req: RequestType, res: ResponseType, next: restify.Next): void {
+-    try {
+-      logging.debug(`removeAccessKey request ${JSON.stringify(req.params)}`);
++  async removeAccessKey(req: RequestType, res: ResponseType, next: restify.Next): Promise<void> {
++    try {
++      logging.debug('removeAccessKey request');
+       const accessKeyId = validateAccessKeyId(req.params.id);
+-      this.accessKeys.removeAccessKey(accessKeyId);
++      await this.accessKeys.removeAccessKey(accessKeyId);
+       res.send(HttpSuccess.NO_CONTENT);
+       return next();
+     } catch (error) {
+@@ -515,7 +518,7 @@
+ 
+   renameAccessKey(req: RequestType, res: ResponseType, next: restify.Next): void {
+     try {
+-      logging.debug(`renameAccessKey request ${JSON.stringify(req.params)}`);
++      logging.debug('renameAccessKey request');
+       const accessKeyId = validateAccessKeyId(req.params.id);
+       const name = req.params.name;
+       if (!name) {
+@@ -565,7 +568,7 @@
+ 
+   async removeAccessKeyDataLimit(req: RequestType, res: ResponseType, next: restify.Next) {
+     try {
+-      logging.debug(`removeAccessKeyDataLimit request ${JSON.stringify(req.params)}`);
++      logging.debug('removeAccessKeyDataLimit request');
+       const accessKeyId = validateAccessKeyId(req.params.id);
+       // Enforcement is done asynchronously in the proxy server.  This is transparent to the manager
+       // so this doesn't introduce any race conditions between the server and UI.
+@@ -603,7 +606,7 @@
+ 
+   async removeDefaultDataLimit(req: RequestType, res: ResponseType, next: restify.Next) {
+     try {
+-      logging.debug(`removeDefaultDataLimit request ${JSON.stringify(req.params)}`);
++      logging.debug('removeDefaultDataLimit request');
+       // Enforcement is done asynchronously in the proxy server.  This is transparent to the manager
+       // so this doesn't introduce any race conditions between the server and UI.
+       this.accessKeys.removeDefaultDataLimit();
+@@ -619,10 +622,10 @@
+ 
+   async getDataUsage(req: RequestType, res: ResponseType, next: restify.Next) {
+     try {
+-      logging.debug(`getDataUsage request ${JSON.stringify(req.params)}`);
++      logging.debug('getDataUsage request');
+       const response = await this.managerMetrics.getOutboundByteTransfer({hours: 30 * 24});
+       res.send(HttpSuccess.OK, response);
+-      logging.debug(`getDataUsage response ${JSON.stringify(response)}`);
++      logging.debug('getDataUsage response');
+       return next();
+     } catch (error) {
+       logging.error(error);
+@@ -631,7 +634,7 @@
+   }
+ 
+   async getServerMetrics(req: RequestType, res: ResponseType, next: restify.Next) {
+-    logging.debug(`getServerMetrics request ${JSON.stringify(req.params)}`);
++    logging.debug('getServerMetrics request');
+ 
+     let seconds;
+     try {
+@@ -650,7 +653,7 @@
+     try {
+       const response = await this.managerMetrics.getServerMetrics({seconds});
+       res.send(HttpSuccess.OK, response);
+-      logging.debug(`getServerMetrics response ${JSON.stringify(response)}`);
++      logging.debug('getServerMetrics response');
+       return next();
+     } catch (error) {
+       logging.error(error);
+@@ -659,7 +662,7 @@
+   }
+ 
+   getShareMetrics(req: RequestType, res: ResponseType, next: restify.Next): void {
+-    logging.debug(`getShareMetrics request ${JSON.stringify(req.params)}`);
++    logging.debug('getShareMetrics request');
+     const response = {metricsEnabled: this.metricsPublisher.isSharingEnabled()};
+     res.send(HttpSuccess.OK, response);
+     logging.debug(`getShareMetrics response: ${JSON.stringify(response)}`);
+--- a/src/shadowbox/server/server_access_key.ts
++++ b/src/shadowbox/server/server_access_key.ts
+@@ -247,8 +247,7 @@
+       if (accessKey.id === id) {
+         this.accessKeys.splice(ai, 1);
+         this.saveAccessKeys();
+-        this.updateServer();
+-        return;
++        return this.updateServer();
+       }
+     }
+     throw new errors.AccessKeyNotFound(id);
+--- a/src/shadowbox/model/access_key.ts
++++ b/src/shadowbox/model/access_key.ts
+@@ -64,7 +64,7 @@
+   // Creates a new access key. Parameters are chosen automatically if not provided.
+   createNewAccessKey(params?: AccessKeyCreateParams): Promise<AccessKey>;
+   // Removes the access key given its id. Throws on failure.
+-  removeAccessKey(id: AccessKeyId);
++  removeAccessKey(id: AccessKeyId): void | Promise<void>;
+   // Returns the access key with the given id. Throws on failure.
+   getAccessKey(id: AccessKeyId): AccessKey;
+   // Lists all existing access keys
+--- a/src/shadowbox/server/server_config.ts
++++ b/src/shadowbox/server/server_config.ts
+@@ -12,7 +12,7 @@
+ // See the License for the specific language governing permissions and
+ // limitations under the License.
+ 
+-import * as uuidv4 from 'uuid/v4';
++import {randomUUID as uuidv4} from 'crypto';
+ 
+ import * as json_config from '../infrastructure/json_config';
+ import {DataLimit} from '../model/access_key';
+--- a/src/shadowbox/infrastructure/logging.ts
++++ b/src/shadowbox/infrastructure/logging.ts
+@@ -44,6 +44,8 @@
+   // See
+   // https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/Date/toISOString
+   const timeStr = new Date().toISOString();
++  const apiSecret = process.env.SB_API_PREFIX;
++  if (apiSecret) message = String(message).split(apiSecret).join('[REDACTED]');
+   // TODO(alalama): preserve the source file structure in the webpack build so we can use
+   // `callsite.getFileName()`.
+   return `${level}${timeStr} ${process.pid} ${path.basename(

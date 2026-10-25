@@ -1,0 +1,19 @@
+table inet pi_guard {
+    chain input {
+        type filter hook input priority -10; policy drop;
+        iifname "lo" counter accept
+        ct state established,related counter accept
+        ct state invalid counter drop
+        meta l4proto icmp counter accept
+        meta l4proto ipv6-icmp counter accept
+        udp sport 67 udp dport 68 counter accept
+        udp sport 547 udp dport 546 counter accept
+        tcp dport 80 ct state new limit rate 200/second burst 400 packets counter accept
+        udp dport 80 counter accept
+        ip saddr 10.0.0.0/24 tcp dport { 22, 5900, 18501, 1935, 8554, 8888, 8889 } counter accept
+        ip saddr 10.0.0.0/24 udp dport { 5353, 8000, 8001, 8189, 8890 } counter accept
+        ip6 saddr fc00::/7 tcp dport { 22, 5900, 18501, 1935, 8554, 8888, 8889 } counter accept
+        ip6 saddr { fc00::/7, fe80::/10 } udp dport { 5353, 8000, 8001, 8189, 8890 } counter accept
+        counter drop
+    }
+}

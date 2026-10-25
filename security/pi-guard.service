@@ -1,0 +1,14 @@
+[Unit]
+Description=Pi inbound firewall without changing Docker forwarding
+After=network-pre.target
+Before=network.target docker.service
+Wants=network-pre.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/pi-guard-apply
+ExecReload=/usr/local/sbin/pi-guard-apply
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,767 @@
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/config.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/config.go
+@@ -37,9 +37,10 @@
+ }
+ 
+ type KeyConfig struct {
+-	ID     string
+-	Cipher string
+-	Secret string
++	ID        string
++	Cipher    string
++	Secret    string
++	LANAccess bool `yaml:"lan_access"`
+ }
+ 
+ type LegacyKeyServiceConfig struct {
+@@ -57,6 +58,21 @@
+ 
+ // Validate checks that the config is valid.
+ func (c *Config) Validate() error {
++	var keys []KeyConfig
++	for _, key := range c.Keys {
++		keys = append(keys, key.KeyConfig)
++	}
++	for _, service := range c.Services {
++		keys = append(keys, service.Keys...)
++	}
++	ids, secrets := make(map[string]bool), make(map[string]bool)
++	for _, key := range keys {
++		identity := key.Cipher + "\x00" + key.Secret
++		if key.ID == "" || ids[key.ID] || secrets[identity] {
++			return fmt.Errorf("access key identities and credentials must be unique")
++		}
++		ids[key.ID], secrets[identity] = true, true
++	}
+ 	existingListeners := make(map[string]bool)
+ 	for _, serviceConfig := range c.Services {
+ 		for _, lnConfig := range serviceConfig.Listeners {
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/main.go
+@@ -16,6 +16,7 @@
+ 
+ import (
+ 	"container/list"
++	"crypto/sha256"
+ 	"flag"
+ 	"fmt"
+ 	"log/slog"
+@@ -65,19 +66,21 @@
+ 	serviceMetrics      service.ServiceMetrics
+ 	replayCache         service.ReplayCache
+ 	allowPrivateTargets bool
+-}
+-
+-func (s *OutlineServer) loadConfig(filename string) error {
++	access              *routerAccessPolicy
++}
++
++func (s *OutlineServer) loadConfig(filename string) (string, error) {
+ 	configData, err := os.ReadFile(filename)
+ 	if err != nil {
+-		return fmt.Errorf("failed to read config file %s: %w", filename, err)
+-	}
++		return "", fmt.Errorf("failed to read config file %s: %w", filename, err)
++	}
++	digest := fmt.Sprintf("%x", sha256.Sum256(configData))
+ 	config, err := readConfig(configData)
+ 	if err != nil {
+-		return fmt.Errorf("failed to load config (%v): %w", filename, err)
++		return digest, fmt.Errorf("failed to load config (%v): %w", filename, err)
+ 	}
+ 	if err := config.Validate(); err != nil {
+-		return fmt.Errorf("failed to validate config: %w", err)
++		return digest, fmt.Errorf("failed to validate config: %w", err)
+ 	}
+ 
+ 	// We hot swap the config by having the old and new listeners both live at
+@@ -85,13 +88,14 @@
+ 	// and then close the old ones after.
+ 	stopConfig, err := s.runConfig(*config)
+ 	if err != nil {
+-		return err
++		return digest, err
+ 	}
+ 	if err := s.Stop(); err != nil {
+ 		slog.Warn("Failed to stop old config.", "err", err)
+ 	}
+ 	s.stopConfig = stopConfig
+-	return nil
++	s.access.update(*config)
++	return digest, nil
+ }
+ 
+ func newCipherListFromConfig(config ServiceConfig) (service.CipherList, error) {
+@@ -199,7 +203,9 @@
+ 		startErrCh <- func() error {
+ 			totalCipherCount := len(config.Keys)
+ 			portCiphers := make(map[int]*list.List) // Values are *List of *CipherEntry.
++			portKeys := make(map[int][]KeyConfig)
+ 			for _, keyConfig := range config.Keys {
++				portKeys[keyConfig.Port] = append(portKeys[keyConfig.Port], keyConfig.KeyConfig)
+ 				cipherList, ok := portCiphers[keyConfig.Port]
+ 				if !ok {
+ 					cipherList = list.New()
+@@ -220,6 +226,7 @@
+ 
+ 				ciphers := service.NewCipherList()
+ 				ciphers.Update(cipherList)
++				access := s.access.view(portKeys[portNum])
+ 
+ 				serviceOptions := []service.Option{
+ 					service.WithCiphers(ciphers),
+@@ -227,6 +234,8 @@
+ 					service.WithMetrics(s.serviceMetrics),
+ 					service.WithReplayCache(&s.replayCache),
+ 					service.WithLogger(slog.Default()),
++					service.WithAccessKeyTargetIPValidator(access.validate),
++					service.WithAccessKeyStreamHandler(access.register),
+ 				}
+ 				if s.allowPrivateTargets {
+ 					serviceOptions = append(serviceOptions, service.WithTargetIPValidator(onet.RequireGlobalUnicastIP))
+@@ -252,12 +261,15 @@
+ 				if err != nil {
+ 					return fmt.Errorf("failed to create cipher list from config: %v", err)
+ 				}
++				access := s.access.view(serviceConfig.Keys)
+ 				serviceOptions := []service.Option{
+ 					service.WithCiphers(ciphers),
+ 					service.WithNatTimeout(s.natTimeout),
+ 					service.WithMetrics(s.serviceMetrics),
+ 					service.WithReplayCache(&s.replayCache),
+ 					service.WithLogger(slog.Default()),
++					service.WithAccessKeyTargetIPValidator(access.validate),
++					service.WithAccessKeyStreamHandler(access.register),
+ 				}
+ 				if s.allowPrivateTargets {
+ 					serviceOptions = append(serviceOptions, service.WithTargetIPValidator(onet.RequireGlobalUnicastIP))
+@@ -297,6 +309,8 @@
+ 
+ 	err := <-startErrCh
+ 	if err != nil {
++		stopCh <- struct{}{}
++		<-stopErrCh
+ 		return nil, err
+ 	}
+ 	return func() error {
+@@ -332,8 +346,9 @@
+ 		serviceMetrics:      serviceMetrics,
+ 		replayCache:         service.NewReplayCache(replayHistory),
+ 		allowPrivateTargets: allowPrivateTargets,
+-	}
+-	err := server.loadConfig(filename)
++		access:              newRouterAccessPolicy(allowPrivateTargets),
++	}
++	_, err := server.loadConfig(filename)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("failed to configure server: %w", err)
+ 	}
+@@ -342,9 +357,11 @@
+ 	go func() {
+ 		for range sigHup {
+ 			slog.Info("SIGHUP received. Loading config.", "config", filename)
+-			if err := server.loadConfig(filename); err != nil {
++			digest, err := server.loadConfig(filename)
++			if err != nil {
+ 				slog.Error("Failed to update server. Server state may be invalid. Fix the error and try the update again", "err", err)
+ 			}
++			routerReloadResult(digest, err)
+ 		}
+ 	}()
+ 	return server, nil
+@@ -428,13 +445,11 @@
+ 
+ 	sigCh := make(chan os.Signal, 1)
+ 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+-	if os.Getenv("OUTLINE_ROUTER_READY") == "1" {
+-		ready := os.NewFile(3, "outline-router-ready")
+-		if _, err := ready.Write([]byte("ready\n")); err != nil {
++	if routerReady != nil {
++		if _, err := routerReady.Write([]byte("ready\n")); err != nil {
+ 			slog.Error("Failed to report router readiness", "err", err)
+ 			os.Exit(1)
+ 		}
+-		ready.Close()
+ 	}
+ 	<-sigCh
+ }
+--- /dev/null
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/router_access.go
+@@ -0,0 +1,135 @@
++package main
++
++import (
++	"context"
++	"crypto/sha256"
++	"errors"
++	"fmt"
++	"net"
++	"os"
++	"sync"
++
++	"github.com/Jigsaw-Code/outline-sdk/transport"
++	onet "github.com/Jigsaw-Code/outline-ss-server/net"
++)
++
++type routerKeyGrant struct {
++	fingerprint [32]byte
++	lan         bool
++}
++
++type routerKeyStream struct {
++	id    string
++	close func()
++}
++
++type routerAccessPolicy struct {
++	mu           sync.Mutex
++	keys         map[string]routerKeyGrant
++	streams      map[*routerKeyStream]bool
++	allowPrivate bool
++}
++
++type routerKeyView struct {
++	policy *routerAccessPolicy
++	keys   map[string]routerKeyGrant
++}
++
++func routerGrants(keys []KeyConfig) map[string]routerKeyGrant {
++	grants := make(map[string]routerKeyGrant, len(keys))
++	for _, key := range keys {
++		grants[key.ID] = routerKeyGrant{sha256.Sum256([]byte(key.Cipher + "\x00" + key.Secret)), key.LANAccess}
++	}
++	return grants
++}
++
++func newRouterAccessPolicy(allowPrivate bool) *routerAccessPolicy {
++	return &routerAccessPolicy{keys: make(map[string]routerKeyGrant), streams: make(map[*routerKeyStream]bool), allowPrivate: allowPrivate}
++}
++
++func (p *routerAccessPolicy) view(keys []KeyConfig) routerKeyView {
++	return routerKeyView{p, routerGrants(keys)}
++}
++
++func (p *routerAccessPolicy) update(config Config) {
++	var keys []KeyConfig
++	for _, key := range config.Keys {
++		keys = append(keys, key.KeyConfig)
++	}
++	for _, service := range config.Services {
++		keys = append(keys, service.Keys...)
++	}
++	next := routerGrants(keys)
++	var closeStreams []func()
++	p.mu.Lock()
++	for stream := range p.streams {
++		old := p.keys[stream.id]
++		grant, exists := next[stream.id]
++		if !exists || old.fingerprint != grant.fingerprint || (old.lan && !grant.lan) {
++			closeStreams = append(closeStreams, stream.close)
++			delete(p.streams, stream)
++		}
++	}
++	p.keys = next
++	p.mu.Unlock()
++	for _, closeStream := range closeStreams {
++		closeStream()
++	}
++}
++
++func (v routerKeyView) current(id string) (routerKeyGrant, bool) {
++	grant, ok := v.policy.keys[id]
++	expected, known := v.keys[id]
++	return grant, ok && known && expected.fingerprint == grant.fingerprint
++}
++
++func (v routerKeyView) validate(id string, ip net.IP) error {
++	v.policy.mu.Lock()
++	grant, ok := v.current(id)
++	v.policy.mu.Unlock()
++	if !ok {
++		return errors.New("access key was revoked")
++	}
++	if v.policy.allowPrivate || grant.lan {
++		return onet.RequireGlobalUnicastIP(ip)
++	}
++	return onet.RequirePublicIP(ip)
++}
++
++func (v routerKeyView) register(ctx context.Context, id string, conn transport.StreamConn) (context.Context, func(), error) {
++	v.policy.mu.Lock()
++	defer v.policy.mu.Unlock()
++	if _, ok := v.current(id); !ok {
++		return ctx, nil, errors.New("access key was revoked")
++	}
++	// Listener replacement keeps authorized streams; revocation cancels them explicitly.
++	ctx, cancel := context.WithCancel(context.WithoutCancel(ctx))
++	stream := &routerKeyStream{id: id, close: func() { cancel(); conn.Close() }}
++	v.policy.streams[stream] = true
++	return ctx, func() {
++		cancel()
++		v.policy.mu.Lock()
++		delete(v.policy.streams, stream)
++		v.policy.mu.Unlock()
++	}, nil
++}
++
++var routerReady = func() *os.File {
++	if os.Getenv("OUTLINE_ROUTER_READY") == "1" {
++		return os.NewFile(3, "outline-router-ready")
++	}
++	return nil
++}()
++
++func routerReloadResult(digest string, loadErr error) {
++	if routerReady == nil {
++		return
++	}
++	result := "reloaded"
++	if loadErr != nil {
++		result = "failed"
++	}
++	if _, err := fmt.Fprintf(routerReady, "%s %s\n", result, digest); err != nil {
++		os.Exit(1)
++	}
++}
+--- /dev/null
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/cmd/outline-ss-server/router_access_test.go
+@@ -0,0 +1,102 @@
++package main
++
++import (
++	"context"
++	"io"
++	"net"
++	"testing"
++	"time"
++)
++
++func TestRouterPerKeyTargetPolicy(t *testing.T) {
++	keys := []KeyConfig{{ID: "ordinary", Secret: "ordinary"}, {ID: "owner", Secret: "owner", LANAccess: true}}
++	policy := newRouterAccessPolicy(false)
++	policy.update(Config{Services: []ServiceConfig{{Keys: keys}}})
++	validate := policy.view(keys).validate
++	for _, address := range []string{"10.0.0.127", "172.16.1.1", "192.168.2.1", "fd42::1", "::ffff:10.0.0.127"} {
++		for _, id := range []string{"ordinary", "unknown"} {
++			if validate(id, net.ParseIP(address)) == nil {
++				t.Fatalf("%s reached private target %s", id, address)
++			}
++		}
++		if err := validate("owner", net.ParseIP(address)); err != nil {
++			t.Fatal(address, err)
++		}
++	}
++	for _, id := range []string{"ordinary", "owner"} {
++		if err := validate(id, net.ParseIP("1.1.1.1")); err != nil {
++			t.Fatal(err)
++		}
++		for _, address := range []string{"127.0.0.1", "::1", "169.254.169.254", "fe80::1", "0.0.0.0", "224.0.0.1", "invalid"} {
++			if validate(id, net.ParseIP(address)) == nil {
++				t.Fatalf("accepted forbidden target %s", address)
++			}
++		}
++	}
++	config, err := readConfig([]byte(`{"services":[{"keys":[{"id":"old"},{"id":"owner","lan_access":true}]}]}`))
++	if err != nil || config.Services[0].Keys[0].LANAccess || !config.Services[0].Keys[1].LANAccess {
++		t.Fatal("LAN permissions did not decode or default to denied", err)
++	}
++}
++
++type routerPolicyStream struct{ net.Conn }
++
++func (c routerPolicyStream) CloseRead() error  { return c.Close() }
++func (c routerPolicyStream) CloseWrite() error { return c.Close() }
++
++func TestRouterRevocationClosesOnlyAffectedKeysAndRejectsStaleAuthentication(t *testing.T) {
++	keys := []KeyConfig{{ID: "owner", Secret: "owner", LANAccess: true}, {ID: "other", Secret: "other", LANAccess: true}}
++	policy := newRouterAccessPolicy(false)
++	config := Config{Services: []ServiceConfig{{Keys: keys}}}
++	policy.update(config)
++	view := policy.view(keys)
++	first, firstPeer := net.Pipe()
++	defer firstPeer.Close()
++	second, secondPeer := net.Pipe()
++	defer secondPeer.Close()
++	defer second.Close()
++	parent, cancelParent := context.WithCancel(context.Background())
++	one, releaseOne, err := view.register(parent, "owner", routerPolicyStream{first})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer releaseOne()
++	two, releaseTwo, err := view.register(parent, "other", routerPolicyStream{second})
++	if err != nil {
++		t.Fatal(err)
++	}
++	defer releaseTwo()
++	cancelParent()
++	if one.Err() != nil || two.Err() != nil {
++		t.Fatal("listener reload terminated authorized streams")
++	}
++	keys[0].LANAccess = false
++	policy.update(config)
++	if one.Err() == nil || two.Err() != nil {
++		t.Fatal("revocation did not isolate the affected key")
++	}
++	var data [1]byte
++	firstPeer.SetReadDeadline(time.Now().Add(time.Second))
++	if _, err := firstPeer.Read(data[:]); err != io.EOF {
++		t.Fatal("revoked stream stayed open", err)
++	}
++	if view.validate("owner", net.ParseIP("10.0.0.127")) == nil {
++		t.Fatal("old view retained LAN access")
++	}
++	keys[1].Secret = "replacement"
++	policy.update(config)
++	if two.Err() == nil {
++		t.Fatal("replaced credentials kept their active stream")
++	}
++	if view.validate("other", net.ParseIP("1.1.1.1")) == nil {
++		t.Fatal("old credentials survived replacement")
++	}
++	if _, _, err := view.register(context.Background(), "other", routerPolicyStream{second}); err == nil {
++		t.Fatal("stale authentication registered after revocation")
++	}
++	for _, bad := range [][]KeyConfig{{{ID: "same", Secret: "a"}, {ID: "same", Secret: "b"}}, {{ID: "one", Secret: "same"}, {ID: "two", Secret: "same"}}} {
++		if (&Config{Services: []ServiceConfig{{Keys: bad}}}).Validate() == nil {
++			t.Fatal("ambiguous key identities were accepted")
++		}
++	}
++}
+--- /dev/null
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/service/router_access_test.go
+@@ -0,0 +1,86 @@
++package service
++
++import (
++	"context"
++	"errors"
++	"net"
++	"testing"
++	"time"
++
++	"github.com/Jigsaw-Code/outline-sdk/transport"
++	onet "github.com/Jigsaw-Code/outline-ss-server/net"
++	"github.com/shadowsocks/go-shadowsocks2/socks"
++)
++
++type routerTestStream struct{ net.Conn }
++
++func (c routerTestStream) CloseRead() error  { return c.Close() }
++func (c routerTestStream) CloseWrite() error { return c.Close() }
++
++func TestRouterRevokedAuthenticationCannotReachTarget(t *testing.T) {
++	server, client := net.Pipe()
++	defer server.Close()
++	defer client.Close()
++	ctx, cancel := context.WithCancel(context.Background())
++	defer cancel()
++	h := NewStreamHandler(func(c transport.StreamConn) (string, transport.StreamConn, *onet.ConnectionError) {
++		return "owner", c, nil
++	}, time.Minute)
++	h.SetAccessKeyStreamHandler(func(ctx context.Context, id string, conn transport.StreamConn) (context.Context, func(), error) {
++		return ctx, nil, errors.New("revoked")
++	})
++	done := make(chan struct{})
++	go func() { h.Handle(ctx, routerTestStream{server}, nil); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("revoked authentication was allowed to read a target")
++	}
++}
++
++func TestRouterUDPChecksKeyOnEveryPacket(t *testing.T) {
++	h := NewPacketHandler(time.Minute, nil, nil, nil).(*packetHandler)
++	allow := true
++	h.SetAccessKeyTargetIPValidator(func(id string, ip net.IP) error {
++		if id == "owner" && allow {
++			return onet.RequireGlobalUnicastIP(ip)
++		}
++		return onet.RequirePublicIP(ip)
++	})
++	packet := append([]byte(socks.ParseAddr("10.0.0.127:3389")), []byte("test")...)
++	if _, _, err := h.validatePacket(packet, "ordinary"); err == nil {
++		t.Fatal("untrusted key reached LAN")
++	}
++	if _, _, err := h.validatePacket(packet, "owner"); err != nil {
++		t.Fatal(err)
++	}
++	allow = false
++	if _, _, err := h.validatePacket(packet, "owner"); err == nil {
++		t.Fatal("revoked LAN permission stayed active")
++	}
++}
++
++func TestRouterAuthenticationFloodIsBounded(t *testing.T) {
++	for i := 0; i < cap(routerHandshakeSlots); i++ {
++		routerHandshakeSlots <- struct{}{}
++	}
++	defer func() {
++		for i := 0; i < cap(routerHandshakeSlots); i++ {
++			<-routerHandshakeSlots
++		}
++	}()
++	server, client := net.Pipe()
++	defer server.Close()
++	defer client.Close()
++	h := NewStreamHandler(func(c transport.StreamConn) (string, transport.StreamConn, *onet.ConnectionError) {
++		t.Error("full authentication pool accepted another connection")
++		return "", nil, onet.NewConnectionError("ERR_TEST", "test", nil)
++	}, time.Minute)
++	done := make(chan struct{})
++	go func() { h.Handle(context.Background(), routerTestStream{server}, nil); close(done) }()
++	select {
++	case <-done:
++	case <-time.After(time.Second):
++		t.Fatal("authentication flood was not rejected promptly")
++	}
++}
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/service/shadowsocks.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/service/shadowsocks.go
+@@ -52,12 +52,14 @@
+ type Option func(s *ssService)
+ 
+ type ssService struct {
+-	logger            *slog.Logger
+-	metrics           ServiceMetrics
+-	ciphers           CipherList
+-	natTimeout        time.Duration
+-	replayCache       *ReplayCache
+-	targetIPValidator onet.TargetIPValidator
++	logger                     *slog.Logger
++	metrics                    ServiceMetrics
++	ciphers                    CipherList
++	natTimeout                 time.Duration
++	replayCache                *ReplayCache
++	targetIPValidator          onet.TargetIPValidator
++	accessKeyTargetIPValidator func(string, net.IP) error
++	accessKeyStreamHandler     func(context.Context, string, transport.StreamConn) (context.Context, func(), error)
+ 
+ 	sh StreamHandler
+ 	ph PacketHandler
+@@ -92,6 +94,13 @@
+ 	if s.targetIPValidator != nil {
+ 		s.sh.SetTargetDialer(makeValidatingTCPStreamDialer(s.targetIPValidator))
+ 		s.ph.SetTargetIPValidator(s.targetIPValidator)
++	}
++	if s.accessKeyTargetIPValidator != nil {
++		s.sh.SetAccessKeyTargetIPValidator(s.accessKeyTargetIPValidator)
++		s.ph.SetAccessKeyTargetIPValidator(s.accessKeyTargetIPValidator)
++	}
++	if s.accessKeyStreamHandler != nil {
++		s.sh.SetAccessKeyStreamHandler(s.accessKeyStreamHandler)
+ 	}
+ 
+ 	return s, nil
+@@ -140,6 +149,16 @@
+ 	}
+ }
+ 
++// WithAccessKeyTargetIPValidator applies the authenticated key's destination policy.
++func WithAccessKeyTargetIPValidator(validator func(string, net.IP) error) Option {
++	return func(s *ssService) { s.accessKeyTargetIPValidator = validator }
++}
++
++// WithAccessKeyStreamHandler registers authenticated streams for selective revocation.
++func WithAccessKeyStreamHandler(handler func(context.Context, string, transport.StreamConn) (context.Context, func(), error)) Option {
++	return func(s *ssService) { s.accessKeyStreamHandler = handler }
++}
++
+ // HandleStream handles a Shadowsocks stream-based connection.
+ func (s *ssService) HandleStream(ctx context.Context, conn transport.StreamConn) {
+ 	var connMetrics TCPConnMetrics
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/service/tcp.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/service/tcp.go
+@@ -157,11 +157,13 @@
+ }
+ 
+ type streamHandler struct {
+-	logger       *slog.Logger
+-	listenerId   string
+-	readTimeout  time.Duration
+-	authenticate StreamAuthenticateFunc
+-	dialer       transport.StreamDialer
++	accessKeyTargetIPValidator func(string, net.IP) error
++	accessKeyStreamHandler     func(context.Context, string, transport.StreamConn) (context.Context, func(), error)
++	logger                     *slog.Logger
++	listenerId                 string
++	readTimeout                time.Duration
++	authenticate               StreamAuthenticateFunc
++	dialer                     transport.StreamDialer
+ }
+ 
+ // NewStreamHandler creates a StreamHandler
+@@ -176,8 +178,11 @@
+ 
+ var defaultDialer = makeValidatingTCPStreamDialer(onet.RequirePublicIP)
+ 
++// Bound unauthenticated sockets, including slow probes, without limiting established traffic.
++var routerHandshakeSlots = make(chan struct{}, 256)
++
+ func makeValidatingTCPStreamDialer(targetIPValidator onet.TargetIPValidator) transport.StreamDialer {
+-	return &transport.TCPDialer{Dialer: net.Dialer{Control: func(network, address string, c syscall.RawConn) error {
++	return &transport.TCPDialer{Dialer: net.Dialer{Timeout: 15 * time.Second, Control: func(network, address string, c syscall.RawConn) error {
+ 		ip, _, _ := net.SplitHostPort(address)
+ 		return targetIPValidator(net.ParseIP(ip))
+ 	}}}
+@@ -190,6 +195,16 @@
+ 	SetLogger(l *slog.Logger)
+ 	// SetTargetDialer sets the [transport.StreamDialer] to be used to connect to target addresses.
+ 	SetTargetDialer(dialer transport.StreamDialer)
++	SetAccessKeyTargetIPValidator(func(string, net.IP) error)
++	SetAccessKeyStreamHandler(func(context.Context, string, transport.StreamConn) (context.Context, func(), error))
++}
++
++func (s *streamHandler) SetAccessKeyStreamHandler(handler func(context.Context, string, transport.StreamConn) (context.Context, func(), error)) {
++	s.accessKeyStreamHandler = handler
++}
++
++func (s *streamHandler) SetAccessKeyTargetIPValidator(validator func(string, net.IP) error) {
++	s.accessKeyTargetIPValidator = validator
+ }
+ 
+ func (s *streamHandler) SetLogger(l *slog.Logger) {
+@@ -297,6 +312,8 @@
+ 		return ensureConnectionError(dialErr, "ERR_CONNECT", "Failed to connect to target")
+ 	}
+ 	defer tgtConn.Close()
++	stop := context.AfterFunc(ctx, func() { tgtConn.Close(); clientConn.Close() })
++	defer stop()
+ 	l.LogAttrs(nil, slog.LevelDebug, "Proxy connection.", slog.String("client", clientConn.RemoteAddr().String()), slog.String("target", tgtConn.RemoteAddr().String()))
+ 
+ 	fromClientErrCh := make(chan error)
+@@ -338,6 +355,17 @@
+ 		}
+ 	}
+ 	outerConn.SetReadDeadline(readDeadline)
++	select {
++	case routerHandshakeSlots <- struct{}{}:
++	default:
++		return onet.NewConnectionError("ERR_SERVER_BUSY", "Authentication capacity reached", nil)
++	}
++	held := true
++	defer func() {
++		if held {
++			<-routerHandshakeSlots
++		}
++	}()
+ 
+ 	id, innerConn, authErr := h.authenticate(outerConn)
+ 	if authErr != nil {
+@@ -345,20 +373,36 @@
+ 		h.absorbProbe(outerConn, connMetrics, authErr.Status, proxyMetrics)
+ 		return authErr
+ 	}
++	<-routerHandshakeSlots
++	held = false
+ 	connMetrics.AddAuthenticated(id)
++	if h.accessKeyStreamHandler != nil {
++		var release func()
++		var err error
++		ctx, release, err = h.accessKeyStreamHandler(ctx, id, outerConn)
++		if err != nil {
++			return onet.NewConnectionError("ERR_ACCESS_KEY_REVOKED", "Access key was revoked", err)
++		}
++		defer release()
++	}
+ 
+ 	// Read target address and dial it.
+ 	tgtAddr, err := getProxyRequest(innerConn)
+-	// Clear the deadline for the target address
+-	outerConn.SetReadDeadline(time.Time{})
+ 	if err != nil {
+ 		// Drain to prevent a close on cipher error.
+ 		io.Copy(io.Discard, outerConn)
+ 		return onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", err)
+ 	}
++	outerConn.SetReadDeadline(time.Time{})
++	targetDialer := h.dialer
++	if h.accessKeyTargetIPValidator != nil {
++		targetDialer = makeValidatingTCPStreamDialer(func(ip net.IP) error {
++			return h.accessKeyTargetIPValidator(id, ip)
++		})
++	}
+ 
+ 	dialer := transport.FuncStreamDialer(func(ctx context.Context, addr string) (transport.StreamConn, error) {
+-		tgtConn, err := h.dialer.DialStream(ctx, tgtAddr)
++		tgtConn, err := targetDialer.DialStream(ctx, tgtAddr)
+ 		if err != nil {
+ 			return nil, err
+ 		}
+--- a/vendor/github.com/Jigsaw-Code/outline-ss-server/service/udp.go
++++ b/vendor/github.com/Jigsaw-Code/outline-ss-server/service/udp.go
+@@ -80,12 +80,13 @@
+ }
+ 
+ type packetHandler struct {
+-	logger            *slog.Logger
+-	natTimeout        time.Duration
+-	ciphers           CipherList
+-	m                 UDPMetrics
+-	ssm               ShadowsocksConnMetrics
+-	targetIPValidator onet.TargetIPValidator
++	logger                     *slog.Logger
++	natTimeout                 time.Duration
++	ciphers                    CipherList
++	m                          UDPMetrics
++	ssm                        ShadowsocksConnMetrics
++	targetIPValidator          onet.TargetIPValidator
++	accessKeyTargetIPValidator func(string, net.IP) error
+ }
+ 
+ // NewPacketHandler creates a UDPService
+@@ -112,8 +113,13 @@
+ 	SetLogger(l *slog.Logger)
+ 	// SetTargetIPValidator sets the function to be used to validate the target IP addresses.
+ 	SetTargetIPValidator(targetIPValidator onet.TargetIPValidator)
++	SetAccessKeyTargetIPValidator(func(string, net.IP) error)
+ 	// Handle returns after clientConn closes and all the sub goroutines return.
+ 	Handle(clientConn net.PacketConn)
++}
++
++func (h *packetHandler) SetAccessKeyTargetIPValidator(validator func(string, net.IP) error) {
++	h.accessKeyTargetIPValidator = validator
+ }
+ 
+ func (h *packetHandler) SetLogger(l *slog.Logger) {
+@@ -180,7 +186,7 @@
+ 				}
+ 
+ 				var onetErr *onet.ConnectionError
+-				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData); onetErr != nil {
++				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData, keyID); onetErr != nil {
+ 					return onetErr
+ 				}
+ 
+@@ -203,7 +209,7 @@
+ 				keyID = targetConn.keyID
+ 
+ 				var onetErr *onet.ConnectionError
+-				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData); onetErr != nil {
++				if payload, tgtUDPAddr, onetErr = h.validatePacket(textData, keyID); onetErr != nil {
+ 					return onetErr
+ 				}
+ 			}
+@@ -230,7 +236,7 @@
+ // Given the decrypted contents of a UDP packet, return
+ // the payload and the destination address, or an error if
+ // this packet cannot or should not be forwarded.
+-func (h *packetHandler) validatePacket(textData []byte) ([]byte, *net.UDPAddr, *onet.ConnectionError) {
++func (h *packetHandler) validatePacket(textData []byte, keyID string) ([]byte, *net.UDPAddr, *onet.ConnectionError) {
+ 	tgtAddr := socks.SplitAddr(textData)
+ 	if tgtAddr == nil {
+ 		return nil, nil, onet.NewConnectionError("ERR_READ_ADDRESS", "Failed to get target address", nil)
+@@ -240,7 +246,11 @@
+ 	if err != nil {
+ 		return nil, nil, onet.NewConnectionError("ERR_RESOLVE_ADDRESS", fmt.Sprintf("Failed to resolve target address %v", tgtAddr), err)
+ 	}
+-	if err := h.targetIPValidator(tgtUDPAddr.IP); err != nil {
++	validate := h.targetIPValidator
++	if h.accessKeyTargetIPValidator != nil {
++		validate = func(ip net.IP) error { return h.accessKeyTargetIPValidator(keyID, ip) }
++	}
++	if err := validate(tgtUDPAddr.IP); err != nil {
+ 		return nil, nil, ensureConnectionError(err, "ERR_ADDRESS_INVALID", "invalid address")
+ 	}
+ 
