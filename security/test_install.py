@@ -19,6 +19,7 @@ class MediaConfigTest(unittest.TestCase):
         self.assertEqual(secure_media_config(data), ['eufy'])
         self.assertEqual(data['paths'], kept)
         self.assertTrue(data['rtmp'] and data['rtsp'])
+        self.assertFalse(data['moq'])
         self.assertEqual(data['apiAddress'], '127.0.0.1:9997')
         publishers = [user for user in data['authInternalUsers']
                       if any(p['action'] == 'publish' for p in user['permissions'])]

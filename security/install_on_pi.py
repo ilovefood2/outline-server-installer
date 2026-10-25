@@ -181,6 +181,8 @@ def secure_media_config(data):
         raise RuntimeError('Existing media authentication needs a separate migration')
     if any(user.get('user') != 'any' or user.get('pass') for user in data.get('authInternalUsers', [])):
         raise RuntimeError('Preserve configured media credentials; review before migration')
+    # Do not enable the new protocol merely by upgrading a legacy configuration.
+    data.setdefault('moq', False)
     removed = []
     for name, entry in list(data.get('paths', {}).items()):
         if isinstance(entry, dict) and str(entry.get('recordPath', '')).startswith('/mnt/eufy/cam-recordings/'):
