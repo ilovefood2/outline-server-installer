@@ -326,10 +326,10 @@ def install_guard():
 
 def configure_updates():
     private_write(Path('/etc/apt/apt.conf.d/20auto-upgrades'),
-                  'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n')
+                  'APT::Periodic::Update-Package-Lists "1";\nAPT::Periodic::Unattended-Upgrade "1";\n', 0o644)
     private_write(Path('/etc/apt/apt.conf.d/52pi-security'),
                   'Unattended-Upgrade::Automatic-Reboot "false";\n'
-                  'Unattended-Upgrade::Automatic-Reboot-WithUsers "false";\n')
+                  'Unattended-Upgrade::Automatic-Reboot-WithUsers "false";\n', 0o644)
     run(['systemctl', 'enable', '--now', 'apt-daily.timer', 'apt-daily-upgrade.timer'])
     return {'security_updates_enabled': True, 'automatic_reboot': False}
 

@@ -114,7 +114,7 @@ func udpEcho(c net.PacketConn, target net.Addr) error {
 }
 
 // Check existing live keys without creating, changing or revoking any key.
-func checkLive(state string) {
+func checkLive(state, bindHost, serverHost string) {
 	var config struct {
 		Keys []struct {
 			Method   string `json:"encryptionMethod"`
@@ -126,7 +126,7 @@ func checkLive(state string) {
 	must(err)
 	must(json.Unmarshal(data, &config))
 	require(len(config.Keys) > 0, "no existing keys")
-	tcp, err := net.Listen("tcp", "10.0.0.33:0")
+	tcp, err := net.Listen("tcp", net.JoinHostPort(bindHost, "0"))
 	must(err)
 	defer tcp.Close()
 	go func() {
@@ -138,7 +138,7 @@ func checkLive(state string) {
 			go func() { defer c.Close(); io.Copy(c, c) }()
 		}
 	}()
-	udp, err := net.ListenPacket("udp", "10.0.0.33:0")
+	udp, err := net.ListenPacket("udp", net.JoinHostPort(bindHost, "0"))
 	must(err)
 	defer udp.Close()
 	go func() {
@@ -153,7 +153,7 @@ func checkLive(state string) {
 	}()
 	for _, key := range config.Keys {
 		credentials := base64.RawURLEncoding.EncodeToString([]byte(key.Method + ":" + key.Password))
-		raw := fmt.Sprintf("ss://%s@127.0.0.1:%d/?outline=1&prefix=POST%%20", credentials, key.Port)
+		raw := fmt.Sprintf("ss://%s@%s/?outline=1&prefix=POST%%20", credentials, net.JoinHostPort(serverHost, fmt.Sprint(key.Port)))
 		c, err := stream(raw).DialStream(context.Background(), tcp.Addr().String())
 		must(err)
 		must(echo(c))
@@ -169,7 +169,11 @@ func checkLive(state string) {
 func main() {
 	time.AfterFunc(45*time.Second, func() { fmt.Fprintln(os.Stderr, "integration probe timed out"); os.Exit(2) })
 	if len(os.Args) == 3 && os.Args[1] == "--check-live" {
-		checkLive(os.Args[2])
+		checkLive(os.Args[2], "10.0.0.33", "127.0.0.1")
+		return
+	}
+	if len(os.Args) == 5 && os.Args[1] == "--check-live-external" {
+		checkLive(os.Args[2], os.Args[3], os.Args[4])
 		return
 	}
 	require(len(os.Args) == 4, "usage: probe BASE_URL CERTIFICATE ECHO_TARGET")
