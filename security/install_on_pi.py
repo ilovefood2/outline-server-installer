@@ -15,7 +15,6 @@ import subprocess
 import time
 import urllib.request
 
-import yaml
 
 HERE = Path(__file__).resolve().parent
 STATE = Path('/opt/outline/persisted-state')
@@ -229,88 +228,41 @@ def install_image(backup, manifest):
         raise
 
 
-def secure_media_config(data):
-    if data.get('authMethod', 'internal') != 'internal':
-        raise RuntimeError('Existing media authentication needs a separate migration')
-    if any(user.get('user') != 'any' or user.get('pass') for user in data.get('authInternalUsers', [])):
-        raise RuntimeError('Preserve configured media credentials; review before migration')
-    # Do not enable the new protocol merely by upgrading a legacy configuration.
-    data.setdefault('moq', False)
-    removed = []
-    for name, entry in list(data.get('paths', {}).items()):
-        if isinstance(entry, dict) and str(entry.get('recordPath', '')).startswith('/mnt/eufy/cam-recordings/'):
-            removed.append(name)
-            del data['paths'][name]
-    data['authInternalUsers'] = [
-        {'user': 'any', 'pass': '', 'ips': ['127.0.0.1', '::1', '10.0.0.33'],
-         'permissions': [{'action': 'publish', 'path': ''}]},
-        {'user': 'any', 'pass': '', 'ips': ['127.0.0.1', '::1', '10.0.0.0/24', 'fc00::/7'],
-         'permissions': [{'action': 'read', 'path': ''}, {'action': 'playback', 'path': ''}]},
-        {'user': 'any', 'pass': '', 'ips': ['127.0.0.1', '::1'],
-         'permissions': [{'action': x} for x in ('api', 'metrics', 'pprof')]},
-    ]
-    for field, address in [('apiAddress', '127.0.0.1:9997'), ('metricsAddress', '127.0.0.1:9998'),
-                           ('pprofAddress', '127.0.0.1:9999')]:
-        if field in data:
-            data[field] = address
-    return removed
-
-
-def harden_media(backup):
-    config = Path('/opt/mediamtx/mediamtx.yml')
-    binary = Path('/opt/mediamtx/mediamtx')
-    original_metadata = {path: path.stat() for path in (config, binary)}
-    shutil.copy2(binary, backup / 'mediamtx-original')
-    (backup / 'mediamtx-original').chmod(0o700)
-    shutil.copy2(config, backup / 'mediamtx-original.yml')
-    (backup / 'mediamtx-original.yml').chmod(0o600)
-    data = yaml.safe_load(config.read_text())
-    removed = secure_media_config(data)
-    candidate = backup / 'mediamtx-secure.yml'
-    private_write(candidate, yaml.safe_dump(data, sort_keys=False))
-    check = subprocess.run([str(HERE / 'mediamtx'), '--validate-conf', str(candidate)], capture_output=True, text=True)
-    private_write(backup / 'mediamtx-validation.log', check.stdout + check.stderr)
-    if check.returncode:
-        raise RuntimeError('New media configuration failed validation; see the private log')
+def remove_media(backup):
+    paths = [Path('/opt/mediamtx'), Path('/var/lib/mediamtx'),
+             Path('/etc/systemd/system/mediamtx.service'),
+             Path('/etc/systemd/system/mediamtx.service.d')]
+    unit = subprocess.run(['systemctl', 'show', 'mediamtx.service', '-p', 'LoadState', '--value'],
+                          capture_output=True, text=True)
+    if not any(path.exists() or path.is_symlink() for path in paths) and unit.stdout.strip() == 'not-found':
+        return {'removed': True, 'archived_paths': [], 'account_removed': False}
+    archive = backup / 'removed-mediamtx'
+    archive.mkdir(mode=0o700)
+    subprocess.run(['systemctl', 'disable', '--now', 'mediamtx.service'], check=True, capture_output=True)
     try:
         account = pwd.getpwnam('mediamtx')
-        if account.pw_shell not in ('/usr/sbin/nologin', '/bin/false'):
-            raise RuntimeError('Existing mediamtx account is not a restricted service account')
     except KeyError:
-        run(['useradd', '--system', '--user-group', '--create-home', '--home-dir', '/var/lib/mediamtx',
-             '--shell', '/usr/sbin/nologin', 'mediamtx'])
-        account = pwd.getpwnam('mediamtx')
-    dropin = Path('/etc/systemd/system/mediamtx.service.d/security.conf')
-    previous = dropin.read_bytes() if dropin.exists() else None
-    run(['systemctl', 'stop', 'mediamtx'])
-    try:
-        temporary = binary.with_name('mediamtx.security-new')
-        shutil.copyfile(HERE / 'mediamtx', temporary); temporary.chmod(0o755); os.replace(temporary, binary)
-        private_write(config, candidate.read_text(), 0o640); os.chown(config, 0, account.pw_gid)
-        private_write(dropin, (HERE / 'mediamtx-hardening.conf').read_text(), 0o644)
-        run(['systemctl', 'daemon-reload']); run(['systemctl', 'start', 'mediamtx'])
-        time.sleep(3)
-        run(['systemctl', 'is-active', '--quiet', 'mediamtx'])
-        pid = run(['systemctl', 'show', 'mediamtx', '-p', 'MainPID', '--value'])
-        status = (Path('/proc') / pid / 'status').read_text()
-        if ('NoNewPrivs:\t1' not in status or status.split('Uid:\t', 1)[1].split()[0] != str(account.pw_uid)):
-            raise RuntimeError('Media privilege isolation did not take effect')
-        return {'active': True, 'dedicated_account': True, 'no_new_privileges': True,
-                'unused_eufy_paths_removed': len(removed), 'publisher_sources': 'same host only',
-                'reader_sources': 'trusted LAN and Outline', 'recording_files_deleted': False}
-    except Exception:
-        subprocess.run(['systemctl', 'stop', 'mediamtx'], capture_output=True)
-        shutil.copy2(backup / 'mediamtx-original', binary)
-        shutil.copy2(backup / 'mediamtx-original.yml', config)
-        for path, metadata in original_metadata.items():
-            os.chown(path, metadata.st_uid, metadata.st_gid)
-            path.chmod(stat.S_IMODE(metadata.st_mode))
-        if previous is None:
-            dropin.unlink(missing_ok=True)
-        else:
-            dropin.write_bytes(previous)
-        run(['systemctl', 'daemon-reload']); run(['systemctl', 'start', 'mediamtx'])
-        raise
+        account = None
+    if account and subprocess.run(['pgrep', '-u', str(account.pw_uid)], capture_output=True).returncode == 0:
+        raise RuntimeError('A process still uses the media account; review before removing it')
+    moved = []
+    for path in paths:
+        if path.exists() or path.is_symlink():
+            destination = archive / str(path).lstrip('/')
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            path.rename(destination)
+            moved.append(str(path))
+    removed_account = False
+    if (account and 0 < account.pw_uid < 1000 and account.pw_dir == '/var/lib/mediamtx'
+            and account.pw_shell in ('/usr/sbin/nologin', '/bin/false')):
+        private_write(archive / 'account.json', json.dumps({'uid': account.pw_uid, 'gid': account.pw_gid,
+                                                         'home': account.pw_dir, 'shell': account.pw_shell}) + '\n')
+        run(['userdel', 'mediamtx'])
+        removed_account = True
+    run(['systemctl', 'daemon-reload'])
+    subprocess.run(['systemctl', 'reset-failed', 'mediamtx.service'], capture_output=True)
+    return {'removed': True, 'archived_paths': moved, 'account_removed': removed_account,
+            'backup': str(archive), 'recordings_deleted': False}
 
 
 def install_guard():
@@ -319,7 +271,8 @@ def install_guard():
     private_write(Path('/etc/systemd/system/pi-guard.service'), (HERE / 'pi-guard.service').read_text(), 0o644)
     run(['/usr/local/sbin/pi-guard-apply', '--check'])
     run(['systemctl', 'daemon-reload'])
-    run(['systemctl', 'enable', '--now', 'pi-guard.service'])
+    run(['systemctl', 'enable', 'pi-guard.service'])
+    run(['systemctl', 'reload-or-restart', 'pi-guard.service'])
     return {'enabled': True, 'forwarding_chains_changed': False, 'public_data_port': 'TCP/UDP 80',
             'management_sources': 'loopback and trusted LAN'}
 
@@ -358,7 +311,7 @@ def main():
             raise SystemExit('Bundle checksum mismatch')
     result = {'image': install_image(backup, manifest)}
     private_write(backup / 'deployment-status.json', json.dumps(result, indent=2) + '\n')
-    result['media'] = harden_media(backup)
+    result['media'] = remove_media(backup)
     private_write(backup / 'deployment-status.json', json.dumps(result, indent=2) + '\n')
     result['firewall'] = install_guard()
     result['updates'] = configure_updates()

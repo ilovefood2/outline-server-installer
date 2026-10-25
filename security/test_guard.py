@@ -37,7 +37,7 @@ class T(socketserver.BaseRequestHandler):
  def handle(self):self.request.sendall(b'OK')
 class U(socketserver.BaseRequestHandler):
  def handle(self):self.request[1].sendto(self.request[0],self.client_address)
-for cls,handler,ports in ((TCP,T,(22,80,18501,9090)),(UDP,U,(80,8000))):
+for cls,handler,ports in ((TCP,T,(22,80,18501,8554,9090)),(UDP,U,(80,8000))):
  for port in ports:
   srv=cls(('::',port),handler)
   threading.Thread(target=srv.serve_forever,daemon=True).start()
@@ -75,7 +75,7 @@ while True:time.sleep(60)
 import json,socket,sys
 host=sys.argv[1]; family=socket.AF_INET6 if ':' in host else socket.AF_INET
 results={}
-for port in (22,80,18501,9090):
+for port in (22,80,18501,8554,9090):
  try:
   with socket.create_connection((host,port),.6) as s:results['tcp'+str(port)]=s.recv(2)==b'OK'
  except (TimeoutError,OSError):results['tcp'+str(port)]=False
@@ -88,7 +88,7 @@ print(json.dumps(results))
 ''', destination])
                 results = json.loads(output)
                 assert results == {'tcp22': allowed, 'tcp80': True, 'tcp18501': allowed,
-                                   'tcp9090': False, 'udp80': True, 'udp8000': allowed}, (destination, results)
+                                   'tcp8554': False, 'tcp9090': False, 'udp80': True, 'udp8000': False}, (destination, results)
                 report[destination] = results
         print(json.dumps(report, indent=2))
     finally:
