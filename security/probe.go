@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -112,8 +113,65 @@ func udpEcho(c net.PacketConn, target net.Addr) error {
 	return nil
 }
 
+// Check existing live keys without creating, changing or revoking any key.
+func checkLive(state string) {
+	var config struct {
+		Keys []struct {
+			Method   string `json:"encryptionMethod"`
+			Password string `json:"password"`
+			Port     int    `json:"port"`
+		} `json:"accessKeys"`
+	}
+	data, err := os.ReadFile(filepath.Join(state, "shadowbox_config.json"))
+	must(err)
+	must(json.Unmarshal(data, &config))
+	require(len(config.Keys) > 0, "no existing keys")
+	tcp, err := net.Listen("tcp", "10.0.0.33:0")
+	must(err)
+	defer tcp.Close()
+	go func() {
+		for {
+			c, err := tcp.Accept()
+			if err != nil {
+				return
+			}
+			go func() { defer c.Close(); io.Copy(c, c) }()
+		}
+	}()
+	udp, err := net.ListenPacket("udp", "10.0.0.33:0")
+	must(err)
+	defer udp.Close()
+	go func() {
+		b := make([]byte, 8192)
+		for {
+			n, addr, err := udp.ReadFrom(b)
+			if err != nil {
+				return
+			}
+			udp.WriteTo(b[:n], addr)
+		}
+	}()
+	for _, key := range config.Keys {
+		credentials := base64.RawURLEncoding.EncodeToString([]byte(key.Method + ":" + key.Password))
+		raw := fmt.Sprintf("ss://%s@127.0.0.1:%d/?outline=1&prefix=POST%%20", credentials, key.Port)
+		c, err := stream(raw).DialStream(context.Background(), tcp.Addr().String())
+		must(err)
+		must(echo(c))
+		c.Close()
+		p := packet(raw)
+		must(udpEcho(p, udp.LocalAddr()))
+		p.Close()
+	}
+	json.NewEncoder(os.Stdout).Encode(map[string]any{"keys_tested": len(config.Keys),
+		"private_tcp": true, "private_udp": true, "full_post_prefix": true, "keys_modified": false})
+}
+
 func main() {
 	time.AfterFunc(45*time.Second, func() { fmt.Fprintln(os.Stderr, "integration probe timed out"); os.Exit(2) })
+	if len(os.Args) == 3 && os.Args[1] == "--check-live" {
+		checkLive(os.Args[2])
+		return
+	}
 	require(len(os.Args) == 4, "usage: probe BASE_URL CERTIFICATE ECHO_TARGET")
 	base, certificate, target := os.Args[1], os.Args[2], os.Args[3]
 	cert, err := os.ReadFile(certificate)
@@ -153,6 +211,16 @@ func main() {
 	must(json.Unmarshal(request("GET", "/access-keys", nil, 200), &keys))
 	require(len(keys.Keys) == 1, "original key was not retained")
 	original := keys.Keys[0]
+	loopbackClient := &http.Client{Timeout: 5 * time.Second, Transport: &http.Transport{
+		DialContext: func(ctx context.Context, _, address string) (net.Conn, error) {
+			return stream(original.URL).DialStream(ctx, address)
+		},
+	}}
+	loopbackResponse, err := loopbackClient.Get("http://127.0.0.1:9090/-/ready")
+	if loopbackResponse != nil {
+		loopbackResponse.Body.Close()
+	}
+	require(err != nil, "VPN key bypassed loopback target restrictions")
 	stable, err := stream(original.URL).DialStream(context.Background(), target)
 	must(err)
 	defer stable.Close()
@@ -207,5 +275,6 @@ func main() {
 		"manager_over_outline": true, "delete_waits_for_backend": true, "revoked_tcp_closed": true,
 		"revoked_new_tcp_denied": true, "revoked_udp_denied": true, "unrelated_stream_preserved": true,
 		"metrics_apis": true, "oversized_body_rejected": true, "ipv6_key_format": true,
+		"loopback_targets_blocked": true,
 	})
 }

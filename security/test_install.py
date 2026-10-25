@@ -4,8 +4,9 @@ import unittest
 from unittest.mock import patch
 import subprocess
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
-from install_on_pi import secure_media_config, sync_state
+from install_on_pi import secure_media_config, sync_state, restore_checkpoint
 
 
 class MediaConfigTest(unittest.TestCase):
@@ -60,6 +61,22 @@ class StateSyncTest(unittest.TestCase):
             for live in (False, True):
                 with self.assertRaises(RuntimeError):
                     sync_state(Path('/fixture'), live=live)
+
+    def test_checkpoint_restore_retains_raw_database(self):
+        with TemporaryDirectory() as directory:
+            staging = Path(directory)
+            data = staging / 'prometheus/data'
+            snapshot = data / 'snapshots/fixture/block'
+            snapshot.mkdir(parents=True)
+            (snapshot / 'index').write_bytes(b'preserved history')
+            (data / 'wal').mkdir()
+            (data / 'wal/000001').write_bytes(b'raw recovery log')
+            restore_checkpoint(staging, 'fixture')
+            self.assertEqual((data / 'block/index').read_bytes(), b'preserved history')
+            self.assertFalse((data / 'wal').exists())
+            self.assertEqual((data.parent / 'data-before-security/wal/000001').read_bytes(), b'raw recovery log')
+            with self.assertRaises(RuntimeError):
+                restore_checkpoint(staging, '../escape')
 
 if __name__ == '__main__':
     unittest.main()

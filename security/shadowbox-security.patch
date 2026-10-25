@@ -8,7 +8,15 @@
  
  import {RealClock} from '../infrastructure/clock';
  import {PortProvider} from '../infrastructure/get_port';
-@@ -239,24 +238,32 @@
+@@ -177,7 +176,6 @@
+   const prometheusArgs = [
+     '--config.file',
+     prometheusConfigFilename,
+-    '--web.enable-admin-api',
+     '--storage.tsdb.retention.time',
+     '31d',
+     '--storage.tsdb.path',
+@@ -239,24 +237,32 @@
    });
  
    // Pre-routing handlers

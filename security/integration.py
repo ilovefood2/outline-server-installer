@@ -102,6 +102,15 @@ tcp.serve_forever()
         output = docker(['exec', client, '/probe', 'https://10.23.0.2:18501/' + prefix,
                          '/fixture.crt', '10.23.0.3:8080'], timeout=55)
         report = json.loads(output)
+        docker(['exec', '--user', '31999:31999', server, 'node', '-e', '''
+const http=require('http');
+const q=http.request({host:'127.0.0.1',port:9090,path:'/api/v1/admin/tsdb/snapshot',method:'POST'},r=>{
+ let body='';r.on('data',b=>body+=b);r.on('end',()=>{
+  if(r.statusCode<400 || JSON.parse(body).error!=='admin APIs disabled')process.exitCode=1;
+ });
+});q.on('error',()=>{process.exitCode=1});q.end();
+'''])
+        report['prometheus_admin_disabled'] = True
         report['docker_health'] = True
         report['processes'] = docker(['top', server, '-eo', 'pid,uid,comm'])
         report['image_id'] = docker(['image', 'inspect', args.image, '--format', '{{.Id}}'])

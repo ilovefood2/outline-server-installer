@@ -13,6 +13,7 @@ import ssl
 import stat
 import subprocess
 import time
+import urllib.request
 
 import yaml
 
@@ -55,6 +56,21 @@ def sync_state(staging, live=False):
     # TSDB compaction can remove files during the online copy; the frozen sync must be exact.
     if copied.returncode not in ((0, 24) if live else (0,)):
         raise RuntimeError('State synchronization failed with exit ' + str(copied.returncode))
+
+
+def restore_checkpoint(staging, name):
+    if Path(name).name != name or not name:
+        raise RuntimeError('Unsafe metrics checkpoint name')
+    data = staging / 'prometheus/data'
+    snapshot = data / 'snapshots' / name
+    if not snapshot.is_dir() or not any(snapshot.iterdir()):
+        raise RuntimeError('Missing metrics checkpoint')
+    previous = data.with_name('data-before-security')
+    if previous.exists():
+        raise RuntimeError('Unexpected existing metrics archive')
+    data.rename(previous)
+    # Link only inside the new copy; the original rollback database stays independent.
+    shutil.copytree(previous / 'snapshots' / name, data, copy_function=os.link)
 
 
 def manager_request(environment, directory, path):
@@ -120,6 +136,14 @@ def install_image(backup, manifest):
         staging.mkdir(mode=0o700)
         private_write(marker, json.dumps(expected_marker) + '\n')
     sync_state(staging, live=True)
+    request = urllib.request.Request('http://127.0.0.1:9090/api/v1/admin/tsdb/snapshot', method='POST')
+    with urllib.request.urlopen(request, timeout=90) as response:
+        checkpoint = json.load(response)
+    if checkpoint.get('status') != 'success':
+        raise RuntimeError('Metrics checkpoint failed')
+    checkpoint_name = checkpoint['data']['name']
+    private_write(backup / 'metrics-checkpoint.json', json.dumps(checkpoint) + '\n')
+    sync_state(staging, live=True)
     renamed = False
     try:
         run(['docker', 'update', '--restart=no', 'shadowbox'])
@@ -130,6 +154,10 @@ def install_image(backup, manifest):
         environment['SB_PUBLIC_IP'] = server_before['hostname']
         private_write(env_file, ''.join(name + '=' + value + '\n' for name, value in environment.items()))
         sync_state(staging)
+        for path in [staging] + list(staging.rglob('*')):
+            if path.is_symlink() or not (path.is_dir() or path.is_file()):
+                raise RuntimeError('Unexpected state entry; refusing migration')
+        restore_checkpoint(staging, checkpoint_name)
         staging.rename(SECURE_STATE)
         # Root startup scripts must remain outside application-writable state.
         startup = SECURE_STATE / 'start_container.sh'
@@ -154,7 +182,7 @@ def install_image(backup, manifest):
         for capability in ('NET_BIND_SERVICE', 'SETUID', 'SETGID', 'SETPCAP'):
             command.extend(['--cap-add', capability])
         run(command + [image['Id']])
-        for _ in range(75):
+        for _ in range(180):
             current = inspect('shadowbox')
             if current['State'].get('Health', {}).get('Status') == 'healthy':
                 break
@@ -190,7 +218,8 @@ def install_image(backup, manifest):
             raise RuntimeError('Expected service processes are missing')
         return {'healthy': True, 'keys_preserved': len(expected), 'certificate_preserved': True,
                 'identity_preserved': True, 'lan_access_preserved': True, 'nonroot_services': True,
-                'running_backend_verified': True, 'rollback_container_restart': 'no'}
+                'running_backend_verified': True, 'rollback_container_restart': 'no',
+                'metrics_checkpoint_restored': True, 'raw_metrics_files_retained': True}
     except Exception:
         if renamed:
             subprocess.run(['docker', 'rm', '-f', 'shadowbox'], capture_output=True)
